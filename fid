@@ -1,0 +1,660 @@
+#! /usr/bin/env python3
+
+import os
+import sys
+import sqlite3
+import hashlib
+import urllib.request
+import subprocess
+import uuid
+from datetime import datetime
+
+
+################ CONFIG ################
+
+DB = os.path.expanduser("~/fid/fid.db")
+CACHE_DIR = os.path.expanduser("~/fid/cache")
+
+KEEP_CACHE = True
+
+BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+########################################
+
+
+############ INIT ######################
+
+
+def ensure_dirs():
+
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def db():
+
+    ensure_dirs()
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS files(
+        md5_hex TEXT PRIMARY KEY,
+        md5_base62 TEXT UNIQUE,
+        size INTEGER,
+        created TEXT
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS locations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        md5_hex TEXT,
+        path TEXT,
+        added TEXT
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS metadata(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        md5_hex TEXT,
+        key TEXT,
+        value TEXT
+    )
+    """)
+
+    conn.commit()
+
+    return conn
+
+
+############ HASH ######################
+
+
+def md5_file(path):
+
+    h = hashlib.md5()
+
+    with open(path, "rb") as f:
+
+        for chunk in iter(lambda: f.read(8192), b""):
+
+            h.update(chunk)
+
+    return h.digest()
+
+
+def base62_encode(data):
+
+    n = int.from_bytes(data, "big")
+
+    s = ""
+
+    while n:
+
+        n, r = divmod(n, 62)
+
+        s = BASE62[r] + s
+
+    return s.zfill(22)
+
+
+############ PATH HANDLING #############
+
+
+def normalize_path(path):
+
+    if "://" in path:
+
+        return path
+
+    if path.startswith("fid://"):
+
+        return path
+
+    return os.path.abspath(path)
+
+
+def split_path(path):
+
+    if "://" in path:
+
+        scheme, rest = path.split("://", 1)
+
+        return scheme, rest
+
+    return "local", path
+
+############ LOOKUP ####################
+
+
+def lookup(conn, prefix):
+
+    return conn.execute(
+        "SELECT md5_hex, md5_base62 FROM files WHERE md5_base62 LIKE ?",
+        (prefix + "%",)
+    ).fetchall()
+
+
+############ CACHE #####################
+
+
+def purge_cache():
+
+    if not os.path.exists(CACHE_DIR):
+        return
+
+    for f in os.listdir(CACHE_DIR):
+
+        try:
+            os.remove(os.path.join(CACHE_DIR, f))
+        except:
+            pass
+
+    print("cache cleared")
+
+
+############ DOWNLOAD ##################
+
+
+def download_temp(prefix, source):
+
+    tmp = os.path.join(CACHE_DIR, "tmp_" + str(uuid.uuid4()))
+
+    try:
+
+        if prefix == "url":
+
+            urllib.request.urlretrieve(f'http://{source}', tmp)
+
+        elif prefix == "ftp":
+
+            urllib.request.urlretrieve(f'ftp://{source}', tmp)
+
+        elif prefix == "sftp":
+
+            subprocess.run(["scp", source, tmp], check=True)
+
+        else:
+
+            return None
+
+        return tmp
+
+    except:
+
+        return None
+
+
+############ REGISTER ##################
+
+
+def register(path):
+
+    conn = db()
+
+    path = normalize_path(path)
+
+    prefix, value = split_path(path)
+
+    if prefix == "local":
+
+        filepath = value
+
+    else:
+
+        tmp = download_temp(prefix, value)
+
+        if not tmp:
+
+            print("download failed")
+
+            return
+
+        filepath = tmp
+
+    if not os.path.exists(filepath):
+
+        print("file missing")
+
+        return
+
+    md5 = md5_file(filepath)
+
+    md5_hex = md5.hex()
+
+    md5_b62 = base62_encode(md5)
+
+    size = os.path.getsize(filepath)
+
+    cur = conn.cursor()
+
+    row = cur.execute(
+        "SELECT size FROM files WHERE md5_hex=?",
+        (md5_hex,)
+    ).fetchone()
+
+    cache_path = os.path.join(CACHE_DIR, md5_b62)
+
+    if row:
+
+        if row[0] != size:
+
+            print("ERROR md5 collision with different size")
+
+            if prefix != "local":
+                os.remove(filepath)
+
+            return
+
+        print("existing id")
+
+        if prefix != "local":
+
+            os.remove(filepath)
+
+    else:
+
+        cur.execute(
+            "INSERT INTO files VALUES (?,?,?,?)",
+            (md5_hex, md5_b62, size, datetime.now())
+        )
+
+        print("registered new file")
+
+        if prefix != "local":
+
+            os.rename(filepath, cache_path)
+
+            cur.execute(
+                "INSERT INTO locations VALUES(NULL,?,?,?)",
+                (md5_hex, "local:" + cache_path, datetime.now())
+            )
+
+    cur.execute(
+        "INSERT INTO locations VALUES(NULL,?,?,?)",
+        (md5_hex, path, datetime.now())
+    )
+
+    conn.commit()
+
+    print(md5_b62)
+
+
+############ RESOLVE ###################
+
+
+def resolve(prefix):
+
+    conn = db()
+
+    if not KEEP_CACHE:
+
+        purge_cache()
+
+    matches = lookup(conn, prefix)
+
+    if len(matches) != 1:
+
+        print("prefix not unique")
+
+        return
+
+    md5_hex, md5_b62 = matches[0]
+
+    cur = conn.cursor()
+
+    rows = cur.execute(
+        "SELECT id,path FROM locations WHERE md5_hex=?",
+        (md5_hex,)
+    ).fetchall()
+
+    remote = []
+
+    for loc_id, path in rows:
+
+        pfx, val = split_path(path)
+
+        if pfx == "local":
+
+            if os.path.exists(val):
+
+                print(val)
+
+                return
+
+            else:
+
+                cur.execute(
+                    "DELETE FROM locations WHERE id=?",
+                    (loc_id,)
+                )
+
+        else:
+
+            remote.append((loc_id, pfx, val))
+
+    conn.commit()
+
+    for loc_id, pfx, val in remote:
+
+        tmp = download_temp(pfx, val)
+
+        if not tmp:
+            continue
+
+        if md5_file(tmp).hex() != md5_hex:
+
+            os.remove(tmp)
+
+            conn.execute(
+                "DELETE FROM locations WHERE id=?",
+                (loc_id,)
+            )
+
+            continue
+
+        cache_path = os.path.join(CACHE_DIR, md5_b62)
+
+        os.rename(tmp, cache_path)
+
+        conn.execute(
+            "INSERT INTO locations VALUES(NULL,?,?,?)",
+            (md5_hex, "local:" + cache_path, datetime.now())
+        )
+
+        conn.commit()
+
+        print(cache_path)
+
+        return
+
+    conn.commit()
+
+    print("no valid locations found")
+
+
+############ ID #######################
+
+def fid_id(path):
+
+    conn = db()
+
+    path = normalize_path(path)
+
+    cur = conn.cursor()
+
+    row = cur.execute(
+        "SELECT md5_hex FROM locations WHERE path=?",
+        (path,)
+    ).fetchone()
+
+    if row:
+
+        md5_hex = row[0]
+
+        md5_b62 = cur.execute(
+            "SELECT md5_base62 FROM files WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchone()[0]
+
+        print(md5_b62)
+
+        return
+
+    register(path)
+
+    row = cur.execute(
+        "SELECT md5_hex FROM locations WHERE path=?",
+        (path,)
+    ).fetchone()
+
+    if row:
+
+        md5_hex = row[0]
+
+        md5_b62 = cur.execute(
+            "SELECT md5_base62 FROM files WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchone()[0]
+
+        #print(md5_b62)
+
+############ VERIFY ####################
+
+
+def verify(prefix):
+
+    conn = db()
+
+    matches = lookup(conn, prefix)
+
+    if len(matches) != 1:
+
+        print("prefix not unique")
+
+        return
+
+    md5_hex = matches[0][0]
+
+    for loc_id, path in conn.execute(
+        "SELECT id,path FROM locations WHERE md5_hex=?",
+        (md5_hex,)
+    ):
+
+        pfx, val = split_path(path)
+
+        if pfx != "local":
+            continue
+
+        if not os.path.exists(val):
+
+            print("MISSING", val)
+
+            continue
+
+        if md5_file(val).hex() == md5_hex:
+
+            print("OK", val)
+
+        else:
+
+            print("MISMATCH", val)
+
+
+############ METADATA ##################
+
+
+def meta_set(prefix, key, value):
+
+    conn = db()
+
+    matches = lookup(conn, prefix)
+
+    if len(matches) != 1:
+
+        print("prefix not unique")
+
+        return
+
+    md5_hex = matches[0][0]
+
+    conn.execute(
+        "DELETE FROM metadata WHERE md5_hex=? AND key=?",
+        (md5_hex, key)
+    )
+
+    conn.execute(
+        "INSERT INTO metadata VALUES(NULL,?,?,?)",
+        (md5_hex, key, value)
+    )
+
+    conn.commit()
+
+
+def meta_get(prefix):
+
+    conn = db()
+
+    matches = lookup(conn, prefix)
+
+    if len(matches) != 1:
+
+        print("prefix not unique")
+
+        return
+
+    md5_hex = matches[0][0]
+
+    for key, value in conn.execute(
+        "SELECT key,value FROM metadata WHERE md5_hex=?",
+        (md5_hex,)
+    ):
+
+        print(f"{key}={value}")
+
+
+def meta_rm(prefix, key):
+
+    conn = db()
+
+    matches = lookup(conn, prefix)
+
+    if len(matches) != 1:
+
+        print("prefix not unique")
+
+        return
+
+    md5_hex = matches[0][0]
+
+    conn.execute(
+        "DELETE FROM metadata WHERE md5_hex=? AND key=?",
+        (md5_hex, key)
+    )
+
+    conn.commit()
+
+
+############ FIND ######################
+
+
+def find(expr):
+
+    key, value = expr.split("=")
+
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT md5_base62
+        FROM metadata
+        JOIN files USING(md5_hex)
+        WHERE key=? AND value=?
+        """,
+        (key, value)
+    ).fetchall()
+
+    for row in rows:
+
+        print(row[0])
+
+
+############ LIST ######################
+
+
+def list_all():
+
+    conn = db()
+    cur = conn.cursor()
+
+    files = cur.execute(
+        "SELECT md5_hex, md5_base62 FROM files ORDER BY md5_base62"
+    ).fetchall()
+
+    for md5_hex, md5_b62 in files:
+
+        print(f"fid://{md5_b62}  ({md5_hex})")
+
+        locations = cur.execute(
+            "SELECT path FROM locations WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchall()
+
+        if not locations:
+
+            print("  (no locations)")
+
+        for (path,) in locations:
+
+            print(f"  {path}")
+
+        print()
+
+############ CLI #######################
+
+
+def main():
+
+    if len(sys.argv) < 2:
+
+        print("usage: fid <command>")
+
+        return
+
+    cmd = sys.argv[1]
+
+    if cmd == "register":
+
+        register(sys.argv[2])
+
+    elif cmd == "resolve":
+
+        resolve(sys.argv[2].replace("fid://", ""))
+
+    elif cmd == "verify":
+
+        verify(sys.argv[2].replace("fid://", ""))
+
+    elif cmd == "meta":
+
+        action = sys.argv[2]
+
+        if action == "set":
+
+            meta_set(sys.argv[3].replace("fid://", ""), sys.argv[4], sys.argv[5])
+
+        elif action == "get":
+
+            meta_get(sys.argv[3].replace("fid://", ""))
+
+        elif action == "rm":
+
+            meta_rm(sys.argv[3].replace("fid://", ""), sys.argv[4])
+
+    elif cmd == "find":
+
+        find(sys.argv[2])
+
+    elif cmd == "list":
+
+        list_all()
+
+    elif cmd == "id":
+
+        fid_id(sys.argv[2])
+
+    elif cmd == "purge-cache":
+
+        purge_cache()
+
+    else:
+
+        print("unknown command")
+
+
+if __name__ == "__main__":
+
+    main()
