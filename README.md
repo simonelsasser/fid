@@ -1,4 +1,4 @@
-# fid — Design Specification (Current Version)
+# fid — Design Specification v1.0
 
 `fid` is a **content-addressable file identity and location registry CLI**.
 
@@ -601,9 +601,7 @@ This enables:
 
 ---
 
-This spec is now stable enough to support:
-
-next threads on
+Ideas:
 
 * Finder integration
 * Spotlight metadata column
