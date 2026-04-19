@@ -1,9 +1,3 @@
-Excellent idea. A clean **design + command summary spec** will make future integrations (Finder, Spotlight, Linux desktop, R bindings, pipelines, web APIs, etc.) much easier to discuss in separate threads.
-
-Below is a concise but complete **fid v1 architecture reference**.
-
----
-
 # fid — Design Specification (Current Version)
 
 `fid` is a **content-addressable file identity and location registry CLI**.
