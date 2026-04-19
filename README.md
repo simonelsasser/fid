@@ -33,16 +33,6 @@ Example:
 fid://3D7p8Kf9Ls0ZxW2jQnRtYu
 ```
 
-Properties:
-
-| property     | meaning                   |
-| ------------ | ------------------------- |
-| immutable    | content-addressable       |
-| portable     | independent of filesystem |
-| deduplicated | identical files share ID  |
-| verifiable   | MD5 integrity check       |
-| shortenable  | prefix lookup supported   |
-
 Example prefix lookup:
 
 ```
