@@ -42,7 +42,6 @@ def db():
     CREATE TABLE IF NOT EXISTS files(
         md5_hex TEXT PRIMARY KEY,
         md5_base62 TEXT UNIQUE,
-        size INTEGER,
         created TEXT
     )
     """)
@@ -99,6 +98,17 @@ def base62_encode(data):
         s = BASE62[r] + s
 
     return s.zfill(22)
+
+
+def base62_decode(s):
+
+    n = 0
+
+    for c in s:
+
+        n = n * 62 + BASE62.index(c)
+
+    return n.to_bytes(16, "big")
 
 
 ############ PATH HANDLING #############
@@ -267,27 +277,16 @@ def register_single(path):
 
     write_spotlight_metadata(filepath, md5_b62)
 
-    size = os.path.getsize(filepath)
-
     cur = conn.cursor()
 
     row = cur.execute(
-        "SELECT size FROM files WHERE md5_hex=?",
+        "SELECT md5_base62 FROM files WHERE md5_hex=?",
         (md5_hex,)
     ).fetchone()
 
     cache_path = os.path.join(CACHE_DIR, md5_b62)
 
     if row:
-
-        if row[0] != size:
-
-            print("ERROR md5 collision with different size", file=sys.stderr)
-
-            if prefix != "local":
-                os.remove(filepath)
-
-            return None
 
         print("existing id", file=sys.stderr)
 
@@ -298,8 +297,8 @@ def register_single(path):
     else:
 
         cur.execute(
-            "INSERT INTO files VALUES (?,?,?,?)",
-            (md5_hex, md5_b62, size, datetime.now())
+            "INSERT INTO files VALUES (?,?,?)",
+            (md5_hex, md5_b62, datetime.now())
         )
 
 
@@ -686,6 +685,188 @@ def clean():
     conn.commit()
     print(f"removed {count} orphaned fid(s)", file=sys.stderr)
 
+############ CSV I/O ####################
+
+
+def parse_csv_line(line):
+    """Parse a CSV line and identify md5_b62, md5_hex, and path columns.
+    
+    Returns tuple (md5_b62, md5_hex, path).
+    Columns can be in any order and md5_b62/md5_hex can be skipped.
+    Validates format by length and character set.
+    """
+    parts = [p.strip() for p in line.split(",")]
+    
+    md5_b62 = None
+    md5_hex = None
+    path = None
+    
+    for part in parts:
+        if not part:
+            continue
+        
+        # Check for explicit prefixes first
+        if part.startswith("fid://"):
+            clean = part[6:]
+            if len(clean) == 22 and all(c in BASE62 for c in clean):
+                if md5_b62 is None:
+                    md5_b62 = clean
+            continue
+        
+        if part.startswith("md5://"):
+            clean = part[6:]
+            if len(clean) == 32 and all(c in "0123456789abcdefABCDEF" for c in clean):
+                if md5_hex is None:
+                    md5_hex = clean.lower()
+            continue
+        
+        # Try to identify by format (no prefix)
+        # 22 base62 chars -> fid
+        if len(part) == 22 and all(c in BASE62 for c in part):
+            if md5_b62 is None:
+                md5_b62 = part
+                continue
+        
+        # 32 hex chars -> md5
+        if len(part) == 32 and all(c in "0123456789abcdefABCDEF" for c in part):
+            if md5_hex is None:
+                md5_hex = part.lower()
+                continue
+        
+        # Otherwise -> path
+        if path is None:
+            path = part
+    
+    return md5_b62, md5_hex, path
+
+
+def write(output_file=None):
+    """Write all registered files to CSV format (fid, md5, path).
+    
+    Output format: fid://base62,md5://hex,path
+    If output_file is None, writes to stdout.
+    """
+    conn = db()
+    cur = conn.cursor()
+    
+    files = cur.execute(
+        "SELECT md5_hex, md5_base62 FROM files ORDER BY md5_base62"
+    ).fetchall()
+    
+    lines = []
+    for md5_hex, md5_b62 in files:
+        locations = cur.execute(
+            "SELECT path FROM locations WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchall()
+        
+        for (path,) in locations:
+            line = f"fid://{md5_b62},md5://{md5_hex},{path}"
+            lines.append(line)
+    
+    output = "\n".join(lines)
+    if lines:
+        output += "\n"
+    
+    if output_file:
+        try:
+            with open(output_file, "w") as f:
+                f.write(output)
+        except Exception as e:
+            print(f"cannot write file: {e}", file=sys.stderr)
+    else:
+        print(output, end="")
+
+
+def read(input_file=None):
+    """Read CSV file (fid, md5, path) and insert directly into database.
+    
+    CSV format: fid://base62,md5://hex,path (columns can be in any order)
+    - Prefixes (fid://, md5://) are optional
+    - Either md5_b62 or md5_hex can be skipped (the other is calculated)
+    - No validation performed; entries inserted as-is
+    - Empty lines and lines starting with # are skipped
+    If input_file is None, reads from stdin.
+    """
+    conn = db()
+    cur = conn.cursor()
+    
+    if input_file:
+        try:
+            with open(input_file, "r") as f:
+                lines = f.readlines()
+        except Exception as e:
+            print(f"cannot read file: {e}", file=sys.stderr)
+            return
+    else:
+        lines = sys.stdin.readlines()
+    
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        
+        # Skip empty lines and comments
+        if not line or line.startswith("#"):
+            continue
+        
+        # Parse the line
+        md5_b62, md5_hex, path = parse_csv_line(line)
+        
+        # Require at least path
+        if not path:
+            print(f"line {line_num}: no valid path found", file=sys.stderr)
+            continue
+        
+        # Calculate missing hash if needed
+        if md5_b62 and not md5_hex:
+            # Decode md5_hex from md5_b62
+            try:
+                md5_bytes = base62_decode(md5_b62)
+                md5_hex = md5_bytes.hex()
+            except (ValueError, IndexError):
+                print(f"line {line_num}: invalid fid format", file=sys.stderr)
+                continue
+        
+        if md5_hex and not md5_b62:
+            # Calculate md5_b62 from md5_hex
+            try:
+                md5_bytes = bytes.fromhex(md5_hex)
+                md5_b62 = base62_encode(md5_bytes)
+            except ValueError:
+                print(f"line {line_num}: invalid md5 hex format", file=sys.stderr)
+                continue
+        
+        # If only path provided, register it as a new file
+        if not md5_b62 and not md5_hex:
+            fid = register_single(path)
+            if fid:
+                print(fid)
+            else:
+                print(f"line {line_num}: failed to register {path}", file=sys.stderr)
+            continue
+        
+        # Insert into database directly (upsert on md5_hex)
+        try:
+            cur.execute(
+                "INSERT OR IGNORE INTO files VALUES (?,?,?)",
+                (md5_hex, md5_b62, datetime.now())
+            )
+            
+            # Insert location
+            cur.execute(
+                "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+                (md5_hex, path)
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO locations VALUES(NULL,?,?,?)",
+                    (md5_hex, path, datetime.now())
+                )
+            
+            conn.commit()
+            print(md5_b62)
+        except Exception as e:
+            print(f"line {line_num}: database error: {e}", file=sys.stderr)
+
 ############ CLI #######################
 
 
@@ -758,6 +939,16 @@ def main():
     elif cmd == "purge-cache":
 
         purge_cache()
+
+    elif cmd == "write":
+
+        output_file = sys.argv[2] if len(sys.argv) > 2 else None
+        write(output_file)
+
+    elif cmd == "read":
+
+        input_file = sys.argv[2] if len(sys.argv) > 2 else None
+        read(input_file)
 
     else:
 
