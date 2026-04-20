@@ -127,6 +127,28 @@ def split_path(path):
 
     return "local", path
 
+
+############ EXPANSION #################
+
+
+def expand_paths(paths):
+    """Expand folders into files and return all file paths."""
+    expanded = []
+    for path in paths:
+        norm_path = normalize_path(path)
+        if os.path.isdir(norm_path):
+            # Add all files in directory (non-recursive)
+            try:
+                for item in os.listdir(norm_path):
+                    item_path = os.path.join(norm_path, item)
+                    if os.path.isfile(item_path):
+                        expanded.append(item_path)
+            except:
+                print(f"cannot read directory: {norm_path}", file=sys.stderr)
+        else:
+            expanded.append(norm_path)
+    return expanded
+
 ############ LOOKUP ####################
 
 
@@ -153,7 +175,7 @@ def purge_cache():
         except:
             pass
 
-    print("cache cleared")
+    print("cache cleared", file=sys.stderr)
 
 
 ############ DOWNLOAD ##################
@@ -184,15 +206,33 @@ def download_temp(prefix, source):
         return tmp
 
     except:
-
+        print("download failed", file=sys.stderr)
         return None
+
+
+############ SPOTLIGHT ##################
+
+import subprocess
+
+def write_spotlight_metadata(path, fid):
+
+    try:
+        subprocess.run([
+            "xattr",
+            "-w",
+            "com.apple.metadata:kMDItemWhereFroms",
+            f"fid://{fid}",
+            path
+        ], check=False)
+    except:
+        pass
 
 
 ############ REGISTER ##################
 
 
-def register(path):
-
+def register_single(path):
+    """Register a single file and return its fid, or None on failure."""
     conn = db()
 
     path = normalize_path(path)
@@ -209,23 +249,23 @@ def register(path):
 
         if not tmp:
 
-            print("download failed")
-
-            return
+            return None
 
         filepath = tmp
 
     if not os.path.exists(filepath):
 
-        print("file missing")
+        print("file missing", file=sys.stderr)
 
-        return
+        return None
 
     md5 = md5_file(filepath)
 
     md5_hex = md5.hex()
 
     md5_b62 = base62_encode(md5)
+
+    write_spotlight_metadata(filepath, md5_b62)
 
     size = os.path.getsize(filepath)
 
@@ -242,14 +282,14 @@ def register(path):
 
         if row[0] != size:
 
-            print("ERROR md5 collision with different size")
+            print("ERROR md5 collision with different size", file=sys.stderr)
 
             if prefix != "local":
                 os.remove(filepath)
 
-            return
+            return None
 
-        print("existing id")
+        print("existing id", file=sys.stderr)
 
         if prefix != "local":
 
@@ -262,32 +302,50 @@ def register(path):
             (md5_hex, md5_b62, size, datetime.now())
         )
 
-        print("registered new file")
 
         if prefix != "local":
 
             os.rename(filepath, cache_path)
 
             cur.execute(
-                "INSERT INTO locations VALUES(NULL,?,?,?)",
-                (md5_hex, "local:" + cache_path, datetime.now())
+                "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+                (md5_hex, cache_path)
             )
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO locations VALUES(NULL,?,?,?)",
+                    (md5_hex, cache_path, datetime.now())
+                )
 
     cur.execute(
-        "INSERT INTO locations VALUES(NULL,?,?,?)",
-        (md5_hex, path, datetime.now())
+        "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+        (md5_hex, path)
     )
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO locations VALUES(NULL,?,?,?)",
+            (md5_hex, path, datetime.now())
+        )
 
     conn.commit()
 
-    print(md5_b62)
+    return md5_b62
+
+
+def register(paths):
+    """Register one or more files/directories."""
+    expanded = expand_paths(paths)
+    for path in expanded:
+        fid = register_single(path)
+        if fid:
+            print(fid)
 
 
 ############ RESOLVE ###################
 
 
-def resolve(prefix):
-
+def resolve_single(prefix):
+    """Resolve a single fid prefix to a path. Returns None if not found."""
     conn = db()
 
     if not KEEP_CACHE:
@@ -298,9 +356,9 @@ def resolve(prefix):
 
     if len(matches) != 1:
 
-        print("prefix not unique")
+        print("prefix not unique", file=sys.stderr)
 
-        return
+        return None
 
     md5_hex, md5_b62 = matches[0]
 
@@ -321,9 +379,7 @@ def resolve(prefix):
 
             if os.path.exists(val):
 
-                print(val)
-
-                return
+                return val
 
             else:
 
@@ -362,24 +418,31 @@ def resolve(prefix):
 
         conn.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, "local:" + cache_path, datetime.now())
+            (md5_hex, cache_path, datetime.now())
         )
 
         conn.commit()
 
-        print(cache_path)
-
-        return
+        return cache_path
 
     conn.commit()
 
-    print("no valid locations found")
+    print("no valid locations found", file=sys.stderr)
+    return None
+
+
+def resolve(prefixes):
+    """Resolve one or more fid prefixes to paths."""
+    for prefix in prefixes:
+        path = resolve_single(prefix.replace("fid://", ""))
+        if path:
+            print(path)
 
 
 ############ ID #######################
 
-def fid_id(path):
-
+def fid_id_single(path):
+    """Get the fid for a single file. Returns None if not found."""
     conn = db()
 
     path = normalize_path(path)
@@ -400,40 +463,32 @@ def fid_id(path):
             (md5_hex,)
         ).fetchone()[0]
 
-        print(md5_b62)
+        return md5_b62
 
-        return
+    fid = register_single(path)
+    return fid
 
-    register(path)
 
-    row = cur.execute(
-        "SELECT md5_hex FROM locations WHERE path=?",
-        (path,)
-    ).fetchone()
-
-    if row:
-
-        md5_hex = row[0]
-
-        md5_b62 = cur.execute(
-            "SELECT md5_base62 FROM files WHERE md5_hex=?",
-            (md5_hex,)
-        ).fetchone()[0]
-
-        #print(md5_b62)
+def fid_id(paths):
+    """Get fids for one or more files."""
+    expanded = expand_paths(paths)
+    for path in expanded:
+        fid = fid_id_single(path)
+        if fid:
+            print(fid)
 
 ############ VERIFY ####################
 
 
-def verify(prefix):
-
+def verify_single(prefix):
+    """Verify a single fid prefix."""
     conn = db()
 
     matches = lookup(conn, prefix)
 
     if len(matches) != 1:
 
-        print("prefix not unique")
+        print("prefix not unique", file=sys.stderr)
 
         return
 
@@ -464,6 +519,12 @@ def verify(prefix):
             print("MISMATCH", val)
 
 
+def verify(prefixes):
+    """Verify one or more fid prefixes."""
+    for prefix in prefixes:
+        verify_single(prefix.replace("fid://", ""))
+
+
 ############ METADATA ##################
 
 
@@ -475,7 +536,7 @@ def meta_set(prefix, key, value):
 
     if len(matches) != 1:
 
-        print("prefix not unique")
+        print("prefix not unique", file=sys.stderr)
 
         return
 
@@ -502,7 +563,7 @@ def meta_get(prefix):
 
     if len(matches) != 1:
 
-        print("prefix not unique")
+        print("prefix not unique", file=sys.stderr)
 
         return
 
@@ -524,7 +585,7 @@ def meta_rm(prefix, key):
 
     if len(matches) != 1:
 
-        print("prefix not unique")
+        print("prefix not unique", file=sys.stderr)
 
         return
 
@@ -593,6 +654,38 @@ def list_all():
 
         print()
 
+
+############ CLEAN ######################
+
+
+def clean():
+    """Remove all fids without any locations."""
+    conn = db()
+    cur = conn.cursor()
+
+    # Find all fids with no locations
+    orphaned = cur.execute(
+        """
+        SELECT md5_hex, md5_base62 FROM files
+        WHERE md5_hex NOT IN (SELECT md5_hex FROM locations)
+        """
+    ).fetchall()
+
+    if not orphaned:
+        print("no orphaned fids found", file=sys.stderr)
+        return
+
+    count = 0
+    for md5_hex, md5_b62 in orphaned:
+        # Delete metadata for this fid
+        cur.execute("DELETE FROM metadata WHERE md5_hex=?", (md5_hex,))
+        # Delete the file entry
+        cur.execute("DELETE FROM files WHERE md5_hex=?", (md5_hex,))
+        count += 1
+
+    conn.commit()
+    print(f"removed {count} orphaned fid(s)", file=sys.stderr)
+
 ############ CLI #######################
 
 
@@ -608,15 +701,24 @@ def main():
 
     if cmd == "register":
 
-        register(sys.argv[2])
+        if len(sys.argv) < 3:
+            print("usage: fid register <path> [<path> ...]", file=sys.stderr)
+            return
+        register(sys.argv[2:])
 
     elif cmd == "resolve":
 
-        resolve(sys.argv[2].replace("fid://", ""))
+        if len(sys.argv) < 3:
+            print("usage: fid resolve <fid> [<fid> ...]", file=sys.stderr)
+            return
+        resolve(sys.argv[2:])
 
     elif cmd == "verify":
 
-        verify(sys.argv[2].replace("fid://", ""))
+        if len(sys.argv) < 3:
+            print("usage: fid verify <fid> [<fid> ...]", file=sys.stderr)
+            return
+        verify(sys.argv[2:])
 
     elif cmd == "meta":
 
@@ -642,9 +744,16 @@ def main():
 
         list_all()
 
+    elif cmd == "clean":
+
+        clean()
+
     elif cmd == "id":
 
-        fid_id(sys.argv[2])
+        if len(sys.argv) < 3:
+            print("usage: fid id <path> [<path> ...]", file=sys.stderr)
+            return
+        fid_id(sys.argv[2:])
 
     elif cmd == "purge-cache":
 
