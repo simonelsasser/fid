@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import os
+import re
 import sys
 import sqlite3
 import hashlib
@@ -30,7 +31,6 @@ def ensure_dirs():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-
 def db():
 
     ensure_dirs()
@@ -42,7 +42,9 @@ def db():
     CREATE TABLE IF NOT EXISTS files(
         md5_hex TEXT PRIMARY KEY,
         md5_base62 TEXT UNIQUE,
-        created TEXT
+        created TEXT,
+        name TEXT,
+        extension TEXT
     )
     """)
 
@@ -140,7 +142,6 @@ def split_path(path):
 
 ############ EXPANSION #################
 
-
 def expand_paths(paths):
     """Expand folders into files and return all file paths."""
     expanded = []
@@ -192,14 +193,21 @@ def purge_cache():
 
 
 def download_temp(prefix, source):
+    print(prefix,source)
 
-    tmp = os.path.join(CACHE_DIR, "tmp_" + str(uuid.uuid4()))
-
+    basename = re.split(r"[/\\\\=]", source)[-1]
+    
+    tmp=os.path.join(CACHE_DIR, basename + '.' + str(uuid.uuid4()))
+ #   tmp = os.path.join(CACHE_DIR, name + "_" + str(uuid.uuid4()) + ext)
+ 
     try:
 
-        if prefix == "url":
+        if prefix in ("url", "http"):
 
             urllib.request.urlretrieve(f'http://{source}', tmp)
+
+        elif prefix == "https":
+            urllib.request.urlretrieve(f'https://{source}', tmp)
 
         elif prefix == "ftp":
 
@@ -212,6 +220,7 @@ def download_temp(prefix, source):
         else:
 
             return None
+        
 
         return tmp
 
@@ -252,6 +261,7 @@ def register_single(path):
     if prefix == "local":
 
         filepath = value
+        basename = os.path.basename(value)
 
     else:
 
@@ -262,6 +272,7 @@ def register_single(path):
             return None
 
         filepath = tmp
+        basename = re.split(r"[/\\\\=]", value)[-1]
 
     if not os.path.exists(filepath):
 
@@ -275,6 +286,11 @@ def register_single(path):
 
     md5_b62 = base62_encode(md5)
 
+    # Extract name and extension from filepath
+
+    name, ext = os.path.splitext(basename)
+    extension = ext.lstrip('.') if ext else ''
+
     write_spotlight_metadata(filepath, md5_b62)
 
     cur = conn.cursor()
@@ -284,11 +300,7 @@ def register_single(path):
         (md5_hex,)
     ).fetchone()
 
-    cache_path = os.path.join(CACHE_DIR, md5_b62)
-
     if row:
-
-        print("existing id", file=sys.stderr)
 
         if prefix != "local":
 
@@ -297,13 +309,17 @@ def register_single(path):
     else:
 
         cur.execute(
-            "INSERT INTO files VALUES (?,?,?)",
-            (md5_hex, md5_b62, datetime.now())
+            "INSERT INTO files VALUES (?,?,?,?,?)",
+            (md5_hex, md5_b62, datetime.now(), name, extension)
         )
 
 
         if prefix != "local":
 
+            #the final filepath and name will be CACHE_DIR/md5_b62/name.ext
+            cache_path = os.path.join(CACHE_DIR, md5_b62, basename)
+
+            os.makedirs(os.path.join(CACHE_DIR, md5_b62), exist_ok=True)
             os.rename(filepath, cache_path)
 
             cur.execute(
@@ -343,8 +359,11 @@ def register(paths):
 ############ RESOLVE ###################
 
 
-def resolve_single(prefix):
-    """Resolve a single fid prefix to a path. Returns None if not found."""
+def resolve_single(prefix, domain=None):
+    """Resolve a single fid prefix to a path. Returns None if not found.
+    
+    If domain is provided, only return paths containing the domain string.
+    """
     conn = db()
 
     if not KEEP_CACHE:
@@ -377,8 +396,9 @@ def resolve_single(prefix):
         if pfx == "local":
 
             if os.path.exists(val):
-
-                return val
+                # Check domain filter
+                if domain is None or domain in val:
+                    return val
 
             else:
 
@@ -396,7 +416,6 @@ def resolve_single(prefix):
     for loc_id, pfx, val in remote:
 
         tmp = download_temp(pfx, val)
-
         if not tmp:
             continue
 
@@ -411,8 +430,10 @@ def resolve_single(prefix):
 
             continue
 
-        cache_path = os.path.join(CACHE_DIR, md5_b62)
+        basename = re.split(r"[/\\\\=]", val)[-1]
+        cache_path = os.path.join(CACHE_DIR, md5_b62, basename)
 
+        os.makedirs(os.path.join(CACHE_DIR, md5_b62), exist_ok=True)
         os.rename(tmp, cache_path)
 
         conn.execute(
@@ -429,11 +450,78 @@ def resolve_single(prefix):
     print("no valid locations found", file=sys.stderr)
     return None
 
+############ ADD ####################
 
-def resolve(prefixes):
-    """Resolve one or more fid prefixes to paths."""
+
+def add_single(fid_prefix, path):
+    """Add a path to an existing fid. Returns True on success, False on failure."""
+    conn = db()
+    
+    path = normalize_path(path)
+    
+    # Look up the fid (requires full 22-char fid or unique prefix)
+    matches = lookup(conn, fid_prefix)
+    
+    if len(matches) == 0:
+        print("fid not found", file=sys.stderr)
+        return False
+    
+    if len(matches) != 1:
+        print("fid prefix not unique", file=sys.stderr)
+        return False
+    
+    md5_hex, md5_b62 = matches[0]
+    
+    cur = conn.cursor()
+    
+    # Check if this path is already registered for this fid
+    cur.execute(
+        "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+        (md5_hex, path)
+    )
+    if cur.fetchone():
+        print("path already registered for this fid", file=sys.stderr)
+        return False
+    
+    # Add the location
+    cur.execute(
+        "INSERT INTO locations VALUES(NULL,?,?,?)",
+        (md5_hex, path, datetime.now())
+    )
+    
+    conn.commit()
+    
+    # Write spotlight metadata
+    write_spotlight_metadata(path, md5_b62)
+    
+    return True
+
+
+def add(args):
+    """Add one or more paths to an existing fid.
+    
+    Usage: fid add <fid> <path> [<path> ...]
+    """
+    if len(args) < 2:
+        print("usage: fid add <fid> <path> [<path> ...]", file=sys.stderr)
+        return
+    
+    fid_prefix = args[0]
+    paths = args[1:]
+    
+    expanded = expand_paths(paths)
+    
+    for path in expanded:
+        if add_single(fid_prefix, path):
+            print(path)
+
+def resolve(prefixes, domain=None):
+    """Resolve one or more fid prefixes to paths.
+    
+    If domain is provided, only print paths containing the domain string.
+    """
     for prefix in prefixes:
-        path = resolve_single(prefix.replace("fid://", ""))
+        path = resolve_single(prefix.replace("fid://", ""), domain=domain)
         if path:
             print(path)
 
@@ -479,8 +567,11 @@ def fid_id(paths):
 ############ VERIFY ####################
 
 
-def verify_single(prefix):
-    """Verify a single fid prefix."""
+def verify_single(prefix, bysize=False):
+    """Verify a single fid prefix.
+    
+    If bysize=True, verify by file size instead of MD5 checksum (faster).
+    """
     conn = db()
 
     matches = lookup(conn, prefix)
@@ -492,6 +583,8 @@ def verify_single(prefix):
         return
 
     md5_hex = matches[0][0]
+    
+    reference_size = None
 
     for loc_id, path in conn.execute(
         "SELECT id,path FROM locations WHERE md5_hex=?",
@@ -501,6 +594,7 @@ def verify_single(prefix):
         pfx, val = split_path(path)
 
         if pfx != "local":
+            print("REMOTE - not verified", val)
             continue
 
         if not os.path.exists(val):
@@ -509,19 +603,36 @@ def verify_single(prefix):
 
             continue
 
-        if md5_file(val).hex() == md5_hex:
-
-            print("OK", val)
-
+        if bysize:
+            # Verify by file size
+            try:
+                file_size = os.path.getsize(val)
+                
+                # Use first file's size as reference
+                if reference_size is None:
+                    reference_size = file_size
+                
+                if file_size == reference_size:
+                    print("OK", val)
+                else:
+                    print("MISMATCH", val)
+            except Exception as e:
+                print("ERROR", val, str(e))
         else:
+            # Verify by MD5 checksum
+            if md5_file(val).hex() == md5_hex:
 
-            print("MISMATCH", val)
+                print("OK", val)
+
+            else:
+
+                print("MISMATCH", val)
 
 
-def verify(prefixes):
+def verify(prefixes, bysize=False):
     """Verify one or more fid prefixes."""
     for prefix in prefixes:
-        verify_single(prefix.replace("fid://", ""))
+        verify_single(prefix.replace("fid://", ""), bysize=bysize)
 
 
 ############ METADATA ##################
@@ -625,33 +736,44 @@ def find(expr):
 ############ LIST ######################
 
 
-def list_all():
-
+def list_all(domain=None):
+    """List all registered files and their locations.
+    
+    If domain is provided, only show locations containing the domain string.
+    """
     conn = db()
     cur = conn.cursor()
 
     files = cur.execute(
-        "SELECT md5_hex, md5_base62 FROM files ORDER BY md5_base62"
+        "SELECT md5_hex, md5_base62, name, extension FROM files ORDER BY md5_base62"
     ).fetchall()
 
-    for md5_hex, md5_b62 in files:
-
-        print(f"fid://{md5_b62}  ({md5_hex})")
+    for md5_hex, md5_b62, name, extension in files:
 
         locations = cur.execute(
             "SELECT path FROM locations WHERE md5_hex=?",
             (md5_hex,)
         ).fetchall()
 
+        # Filter locations by domain if provided
+        if domain is not None:
+            locations = [(path,) for (path,) in locations if domain in path]
+
+        # Build filename with extension
+        filename = name
+        if extension:
+            filename = f"{name}.{extension}"
+
         if not locations:
-
-            print("  (no locations)")
-
-        for (path,) in locations:
-
-            print(f"  {path}")
-
-        print()
+            if domain is None:
+                print(f"fid://{md5_b62}  ({md5_hex}) - {filename}")
+                print("  (no locations)")
+                print()
+        else:
+            print(f"fid://{md5_b62}  ({md5_hex}) - {filename}")
+            for (path,) in locations:
+                print(f"  {path}")
+            print()
 
 
 ############ CLEAN ######################
@@ -684,6 +806,40 @@ def clean():
 
     conn.commit()
     print(f"removed {count} orphaned fid(s)", file=sys.stderr)
+
+############ CLOUDPULL #################
+
+
+def cloudpull(url):
+    """Download CSV from URL, import into fid database, then delete the file.
+    
+    Usage: fid cloudpull <url>
+    URL can start with http://, https://, ftp://, or sftp://
+    """
+    # Parse the URL to extract scheme and source
+    if "://" not in url:
+        print("invalid url format", file=sys.stderr)
+        return
+    
+    prefix, source = url.split("://", 1)
+    
+    # Download the file
+    tmp = download_temp(prefix, source)
+    
+    if not tmp:
+        print("cloudpull failed", file=sys.stderr)
+        return
+    
+    try:
+        # Import the CSV file
+        read(tmp)
+    finally:
+        # Delete the temporary file
+        try:
+            os.remove(tmp)
+        except:
+            pass
+
 
 ############ CSV I/O ####################
 
@@ -740,10 +896,11 @@ def parse_csv_line(line):
     return md5_b62, md5_hex, path
 
 
-def write(output_file=None):
+def write(output_file=None, domain=None):
     """Write all registered files to CSV format (fid, md5, path).
     
     Output format: fid://base62,md5://hex,path
+    If domain is provided, only write locations containing the domain string.
     If output_file is None, writes to stdout.
     """
     conn = db()
@@ -759,6 +916,10 @@ def write(output_file=None):
             "SELECT path FROM locations WHERE md5_hex=?",
             (md5_hex,)
         ).fetchall()
+        
+        # Filter locations by domain if provided
+        if domain is not None:
+            locations = [(path,) for (path,) in locations if domain in path]
         
         for (path,) in locations:
             line = f"fid://{md5_b62},md5://{md5_hex},{path}"
@@ -844,11 +1005,16 @@ def read(input_file=None):
                 print(f"line {line_num}: failed to register {path}", file=sys.stderr)
             continue
         
+        # Extract name and extension from path
+        basename = re.split(r"[/\\\\=]", path)[-1] #check if this works
+        name, ext = os.path.splitext(basename)
+        extension = ext.lstrip('.') if ext else ''
+        
         # Insert into database directly (upsert on md5_hex)
         try:
             cur.execute(
-                "INSERT OR IGNORE INTO files VALUES (?,?,?)",
-                (md5_hex, md5_b62, datetime.now())
+                "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
+                (md5_hex, md5_b62, datetime.now(), name, extension)
             )
             
             # Insert location
@@ -889,17 +1055,30 @@ def main():
 
     elif cmd == "resolve":
 
-        if len(sys.argv) < 3:
-            print("usage: fid resolve <fid> [<fid> ...]", file=sys.stderr)
+        domain = None
+        args = sys.argv[2:]
+        
+        # Parse --domain option
+        if "--domain" in args:
+            idx = args.index("--domain")
+            if idx + 1 < len(args):
+                domain = args[idx + 1]
+                args = args[:idx] + args[idx + 2:]
+        
+        if not args:
+            print("usage: fid resolve [--domain STRING] <fid> [<fid> ...]", file=sys.stderr)
             return
-        resolve(sys.argv[2:])
+        resolve(args, domain=domain)
 
     elif cmd == "verify":
 
-        if len(sys.argv) < 3:
-            print("usage: fid verify <fid> [<fid> ...]", file=sys.stderr)
+        bysize = "--bysize" in sys.argv
+        prefixes = [arg for arg in sys.argv[2:] if arg != "--bysize"]
+        
+        if not prefixes:
+            print("usage: fid verify [--bysize] <fid> [<fid> ...]", file=sys.stderr)
             return
-        verify(sys.argv[2:])
+        verify(prefixes, bysize=bysize)
 
     elif cmd == "meta":
 
@@ -923,7 +1102,16 @@ def main():
 
     elif cmd == "list":
 
-        list_all()
+        domain = None
+        args = sys.argv[2:]
+        
+        # Parse --domain option
+        if "--domain" in args:
+            idx = args.index("--domain")
+            if idx + 1 < len(args):
+                domain = args[idx + 1]
+        
+        list_all(domain=domain)
 
     elif cmd == "clean":
 
@@ -942,13 +1130,37 @@ def main():
 
     elif cmd == "write":
 
-        output_file = sys.argv[2] if len(sys.argv) > 2 else None
-        write(output_file)
+        domain = None
+        args = sys.argv[2:]
+        
+        # Parse --domain option
+        if "--domain" in args:
+            idx = args.index("--domain")
+            if idx + 1 < len(args):
+                domain = args[idx + 1]
+                args = args[:idx] + args[idx + 2:]
+        
+        output_file = args[0] if len(args) > 0 else None
+        write(output_file, domain=domain)
 
     elif cmd == "read":
 
         input_file = sys.argv[2] if len(sys.argv) > 2 else None
         read(input_file)
+
+    elif cmd == "cloudpull":
+
+        if len(sys.argv) < 3:
+            print("usage: fid cloudpull <url>", file=sys.stderr)
+            return
+        cloudpull(sys.argv[2])
+
+    elif cmd == "add":
+
+        if len(sys.argv) < 4:
+            print("usage: fid add <fid> <path> [<path> ...]", file=sys.stderr)
+            return
+        add(sys.argv[2:])
 
     else:
 
