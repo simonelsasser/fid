@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+FIDPATH="$HOME/fid/bin/"
+FIDPATH="$HOME/GitHub/fid/bin/"
+
 ################################################################
 #
 # Cloud Register
@@ -64,12 +67,12 @@ for FILE in "${FILES[@]}"; do
     fi
 
     # Register file with fid and capture the FID
-    FID=$(~/GitHub/fid/bin/fid register "$FILE")
+    FID=$( $FIDPATH/fid register "$FILE" )
     if [[ -z "$FID" ]]; then
         echo "ERROR registering: $FILE"
         continue
     fi
-
+    echo $FID $FILE
     FOLDERNAME="$FID"
 
     # Get basename of file
@@ -93,7 +96,7 @@ for FILE in "${FILES[@]}"; do
         DOWNLOAD_URL="$CLOUDURL/index.php/s/$FOLDERTOKEN/download?path=/$ENCODED_TARGET&files=$ENCODED_FILENAME"
         
         # Register the remote URL with fid
-        ~/GitHub/fid/bin/fid add "$FID" "$DOWNLOAD_URL"
+        $FIDPATH/fid add "$FID" "$DOWNLOAD_URL"
         
         # Output comma-separated FID and DOWNLOAD_URL
         echo "$FID,$DOWNLOAD_URL"

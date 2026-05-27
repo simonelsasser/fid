@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+FIDPATH="$HOME/fid/bin/"
+FIDPATH="$HOME/GitHub/fid/bin/"
+
 ################################################################
 #
 # Cloud Push
@@ -27,7 +30,7 @@ CACHE_DIR="${HOME}/fid/cache"
 REGISTRY_FILE="$CACHE_DIR/fid-registry.csv"
 
 # Write registry to temp file
-if ! ~/GitHub/fid/bin/fid write "$REGISTRY_FILE"; then
+if ! $FIDPATH/fid write "$REGISTRY_FILE"; then
     echo "ERROR writing registry"
     exit 1
 fi

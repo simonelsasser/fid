@@ -288,10 +288,13 @@ def register_single(path):
 
     # Extract name and extension from filepath
 
-    name, ext = os.path.splitext(basename)
-    extension = ext.lstrip('.') if ext else ''
+    if '.' in basename:
+        name, extension = basename.split('.', 1)
+    else:
+        extension = ''
 
-    write_spotlight_metadata(filepath, md5_b62)
+    if prefix != "local":
+        write_spotlight_metadata(filepath, md5_b62)
 
     cur = conn.cursor()
 
@@ -736,10 +739,10 @@ def find(expr):
 ############ LIST ######################
 
 
-def list_all(domain=None):
-    """List all registered files and their locations.
+def yaml_out(project=None):
+    """Output all registered files in YAML format with metadata.
     
-    If domain is provided, only show locations containing the domain string.
+    If project is provided, only show fids that have matching project metadata.
     """
     conn = db()
     cur = conn.cursor()
@@ -748,6 +751,8 @@ def list_all(domain=None):
         "SELECT md5_hex, md5_base62, name, extension FROM files ORDER BY md5_base62"
     ).fetchall()
 
+    output_lines = []
+    
     for md5_hex, md5_b62, name, extension in files:
 
         locations = cur.execute(
@@ -755,25 +760,43 @@ def list_all(domain=None):
             (md5_hex,)
         ).fetchall()
 
-        # Filter locations by domain if provided
-        if domain is not None:
-            locations = [(path,) for (path,) in locations if domain in path]
+        # Get metadata for this file
+        metadata = cur.execute(
+            "SELECT key, value FROM metadata WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchall()
 
-        # Build filename with extension
-        filename = name
-        if extension:
-            filename = f"{name}.{extension}"
+        metadata_dict = dict(metadata) if metadata else {}
 
-        if not locations:
-            if domain is None:
-                print(f"fid://{md5_b62}  ({md5_hex}) - {filename}")
-                print("  (no locations)")
-                print()
-        else:
-            print(f"fid://{md5_b62}  ({md5_hex}) - {filename}")
+        # Filter by project if specified
+        if project is not None:
+            if metadata_dict.get("project") != project:
+                continue
+
+        if locations:
+            # Start YAML entry with fid as key
+            output_lines.append(f"{md5_b62}:")
+            output_lines.append(f"  md5_hex: {md5_hex}")
+            output_lines.append(f"  name: {name}")
+            if extension:
+                output_lines.append(f"  extension: {extension}")
+            
+            # Add locations
+            output_lines.append("  locations:")
             for (path,) in locations:
-                print(f"  {path}")
-            print()
+                output_lines.append(f"    - {path}")
+            
+            # Add metadata if present
+            if metadata_dict:
+                output_lines.append("  metadata:")
+                for key, value in sorted(metadata_dict.items()):
+                    output_lines.append(f"    {key}: {value}")
+            
+            output_lines.append("")  # blank line between entries
+    
+    # Print all output
+    if output_lines:
+        print("\n".join(output_lines))
 
 
 ############ CLEAN ######################
@@ -1007,8 +1030,10 @@ def read(input_file=None):
         
         # Extract name and extension from path
         basename = re.split(r"[/\\\\=]", path)[-1] #check if this works
-        name, ext = os.path.splitext(basename)
-        extension = ext.lstrip('.') if ext else ''
+        if '.' in basename:
+            name, extension = basename.split('.', 1)
+        else:
+            extension = ''
         
         # Insert into database directly (upsert on md5_hex)
         try:
@@ -1102,16 +1127,16 @@ def main():
 
     elif cmd == "list":
 
-        domain = None
+        project = None
         args = sys.argv[2:]
         
-        # Parse --domain option
-        if "--domain" in args:
-            idx = args.index("--domain")
+        # Parse --project option
+        if "--project" in args:
+            idx = args.index("--project")
             if idx + 1 < len(args):
-                domain = args[idx + 1]
+                project = args[idx + 1]
         
-        list_all(domain=domain)
+        yaml_out(project=project)
 
     elif cmd == "clean":
 
