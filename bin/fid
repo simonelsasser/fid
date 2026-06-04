@@ -13,8 +13,8 @@ from datetime import datetime
 
 ################ CONFIG ################
 
-DB = os.path.expanduser("~/fid/fid.db")
-CACHE_DIR = os.path.expanduser("~/fid/cache")
+DB = os.path.expanduser("/Library/Application Support/fid/fid.db")
+CACHE_DIR = os.path.expanduser("/Library/Application Support/fid/cache")
 
 KEEP_CACHE = True
 
