@@ -518,6 +518,85 @@ def add(args):
         if add_single(fid_prefix, path):
             print(path)
 
+
+def update_single(fid_prefix, old_path, new_path):
+    """Update an existing path for a fid, or add new path if old path not found.
+    
+    Returns True on success, False on failure.
+    """
+    conn = db()
+    
+    old_path = normalize_path(old_path)
+    new_path = normalize_path(new_path)
+    
+    # Look up the fid (requires full 22-char fid or unique prefix)
+    matches = lookup(conn, fid_prefix)
+    
+    if len(matches) == 0:
+        print("fid not found", file=sys.stderr)
+        return False
+    
+    if len(matches) != 1:
+        print("fid prefix not unique", file=sys.stderr)
+        return False
+    
+    md5_hex, md5_b62 = matches[0]
+    
+    cur = conn.cursor()
+    
+    # Check if old path exists for this fid
+    row = cur.execute(
+        "SELECT id FROM locations WHERE md5_hex=? AND path=?",
+        (md5_hex, old_path)
+    ).fetchone()
+    
+    if row:
+        # Old path exists, update it
+        loc_id = row[0]
+        
+        # Check if new path already exists for this fid
+        cur.execute(
+            "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+            (md5_hex, new_path)
+        )
+        if cur.fetchone():
+            print("new path already registered for this fid", file=sys.stderr)
+            return False
+        
+        # Update the location
+        cur.execute(
+            "UPDATE locations SET path=? WHERE id=?",
+            (new_path, loc_id)
+        )
+        
+        conn.commit()
+        
+        # Write spotlight metadata for new path
+        write_spotlight_metadata(new_path, md5_b62)
+        
+        return True
+    else:
+        # Old path not found, add new path like fid add does
+        return add_single(fid_prefix, new_path)
+
+
+def update(args):
+    """Update an existing path for a fid, or add new path if old path not found.
+    
+    Usage: fid update <fid> <old_path> <new_path>
+    """
+    if len(args) < 3:
+        print("usage: fid update <fid> <old_path> <new_path>", file=sys.stderr)
+        return
+    
+    fid_prefix = args[0]
+    old_path = args[1]
+    new_path = args[2]
+    
+    if update_single(fid_prefix, old_path, new_path):
+        print(new_path)
+
+
 def resolve(prefixes, domain=None):
     """Resolve one or more fid prefixes to paths.
     
@@ -1208,6 +1287,13 @@ def main():
             print("usage: fid add <fid> <path> [<path> ...]", file=sys.stderr)
             return
         add(sys.argv[2:])
+
+    elif cmd == "update":
+
+        if len(sys.argv) < 5:
+            print("usage: fid update <fid> <old_path> <new_path>", file=sys.stderr)
+            return
+        update(sys.argv[2:5])
 
     elif cmd == "backup":
 
