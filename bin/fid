@@ -1058,6 +1058,28 @@ def read(input_file=None):
         except Exception as e:
             print(f"line {line_num}: database error: {e}", file=sys.stderr)
 
+############ BACKUP ####################
+
+def backup(backup_path):
+    """Create a backup copy of the fid database."""
+    ensure_dirs()
+    
+    backup_path = normalize_path(backup_path)
+    
+    try:
+        source_conn = sqlite3.connect(DB)
+        backup_conn = sqlite3.connect(backup_path)
+        
+        with backup_conn:
+            source_conn.backup(backup_conn)
+        
+        backup_conn.close()
+        source_conn.close()
+        print(f"backup created: {backup_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"backup failed: {e}", file=sys.stderr)
+
+
 ############ CLI #######################
 
 
@@ -1186,6 +1208,13 @@ def main():
             print("usage: fid add <fid> <path> [<path> ...]", file=sys.stderr)
             return
         add(sys.argv[2:])
+
+    elif cmd == "backup":
+
+        if len(sys.argv) < 3:
+            print("usage: fid backup <backup_path>", file=sys.stderr)
+            return
+        backup(sys.argv[2])
 
     else:
 
