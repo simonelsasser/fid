@@ -634,8 +634,7 @@ def fid_id_single(path):
 
         return md5_b62
 
-    fid = register_single(path)
-    return fid
+    return ""
 
 
 def fid_id(paths):
