@@ -66,6 +66,13 @@ def db():
     )
     """)
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS remotes(
+        url TEXT PRIMARY KEY,
+        token TEXT
+    )
+    """)
+
     conn.commit()
 
     return conn
@@ -193,7 +200,6 @@ def purge_cache():
 
 
 def download_temp(prefix, source):
-    print(prefix,source)
 
     basename = re.split(r"[/\\\\=]", source)[-1]
     
@@ -204,10 +210,14 @@ def download_temp(prefix, source):
 
         if prefix in ("url", "http"):
 
-            urllib.request.urlretrieve(f'http://{source}', tmp)
+            full_url = f'http://{source}'
+            full_url = append_token(full_url, get_remote_token(full_url))
+            urllib.request.urlretrieve(full_url, tmp)
 
         elif prefix == "https":
-            urllib.request.urlretrieve(f'https://{source}', tmp)
+            full_url = f'https://{source}'
+            full_url = append_token(full_url, get_remote_token(full_url))
+            urllib.request.urlretrieve(full_url, tmp)
 
         elif prefix == "ftp":
 
@@ -313,7 +323,7 @@ def register_single(path):
 
         cur.execute(
             "INSERT INTO files VALUES (?,?,?,?,?)",
-            (md5_hex, md5_b62, datetime.now(), name, extension)
+            (md5_hex, md5_b62, datetime.now().isoformat(), name, extension)
         )
 
 
@@ -332,7 +342,7 @@ def register_single(path):
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO locations VALUES(NULL,?,?,?)",
-                    (md5_hex, cache_path, datetime.now())
+                    (md5_hex, cache_path, datetime.now().isoformat())
                 )
 
     cur.execute(
@@ -342,7 +352,7 @@ def register_single(path):
     if not cur.fetchone():
         cur.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, path, datetime.now())
+            (md5_hex, path, datetime.now().isoformat())
         )
 
     conn.commit()
@@ -362,10 +372,14 @@ def register(paths):
 ############ RESOLVE ###################
 
 
-def resolve_single(prefix, domain=None):
+def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False):
     """Resolve a single fid prefix to a path. Returns None if not found.
     
     If domain is provided, only return paths containing the domain string.
+    If try_remote is True, query registered remote lookup servers when no
+    local or cached remote location is available.
+    If allow_remote is True, return remote URLs as-is without downloading
+    or validating them.
     """
     conn = db()
 
@@ -375,9 +389,30 @@ def resolve_single(prefix, domain=None):
 
     matches = lookup(conn, prefix)
 
-    if len(matches) != 1:
+    if len(matches) == 0:
 
-        print("prefix not unique", file=sys.stderr)
+        if try_remote and len(prefix) == 22:
+
+            for remote_url, token in get_remote_servers():
+
+                query_url = f"{remote_url}?fid={prefix}"
+
+                if remote_head_ok(query_url):
+
+                    if allow_remote:
+
+                        return query_url
+
+                    if register_remote_host_location(query_url, prefix):
+                        return resolve_single(prefix, domain=domain, try_remote=False, allow_remote=allow_remote)
+        
+        print("fid not found", file=sys.stderr)
+
+        return None
+
+    if len(matches) > 1:
+
+        print("fid not unique", file=sys.stderr)
 
         return None
 
@@ -418,6 +453,15 @@ def resolve_single(prefix, domain=None):
 
     for loc_id, pfx, val in remote:
 
+        remote_url = f"{pfx}://{val}"
+
+        if allow_remote:
+
+            if domain is None or domain in remote_url:
+                return remote_url
+
+            continue
+
         tmp = download_temp(pfx, val)
         if not tmp:
             continue
@@ -432,8 +476,19 @@ def resolve_single(prefix, domain=None):
             )
 
             continue
+        
+        # Prefer registered name/extension; fall back to URL-derived basename
+        row = cur.execute(
+            "SELECT name, extension FROM files WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchone()
+        reg_name, reg_ext = row if row else (None, None)
 
-        basename = re.split(r"[/\\\\=]", val)[-1]
+        if reg_name and reg_ext:
+            basename = f"{reg_name}.{reg_ext}"
+        else:
+            basename = re.split(r"[/\\\\=]", val)[-1]
+
         cache_path = os.path.join(CACHE_DIR, md5_b62, basename)
 
         os.makedirs(os.path.join(CACHE_DIR, md5_b62), exist_ok=True)
@@ -441,7 +496,7 @@ def resolve_single(prefix, domain=None):
 
         conn.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, cache_path, datetime.now())
+            (md5_hex, cache_path, datetime.now().isoformat())
         )
 
         conn.commit()
@@ -449,6 +504,22 @@ def resolve_single(prefix, domain=None):
         return cache_path
 
     conn.commit()
+
+    if try_remote:
+
+        for remote_url, token in get_remote_servers():
+
+            query_url = f"{remote_url}?fid={md5_b62}"
+
+            if remote_head_ok(query_url):
+
+                if allow_remote:
+
+                    return query_url
+
+                add_remote_host_location(query_url, md5_b62)
+
+                return resolve_single(prefix, domain=domain, try_remote=False, allow_remote=allow_remote)
 
     print("no valid locations found", file=sys.stderr)
     return None
@@ -489,7 +560,7 @@ def add_single(fid_prefix, path):
     # Add the location
     cur.execute(
         "INSERT INTO locations VALUES(NULL,?,?,?)",
-        (md5_hex, path, datetime.now())
+        (md5_hex, path, datetime.now().isoformat())
     )
     
     conn.commit()
@@ -597,13 +668,14 @@ def update(args):
         print(new_path)
 
 
-def resolve(prefixes, domain=None):
+def resolve(prefixes, domain=None, allow_remote=False):
     """Resolve one or more fid prefixes to paths.
     
     If domain is provided, only print paths containing the domain string.
+    If allow_remote is True, return remote URLs as-is without downloading.
     """
     for prefix in prefixes:
-        path = resolve_single(prefix.replace("fid://", ""), domain=domain)
+        path = resolve_single(prefix.replace("fid://", ""), domain=domain, allow_remote=allow_remote)
         if path:
             print(path)
 
@@ -1117,7 +1189,7 @@ def read(input_file=None):
         try:
             cur.execute(
                 "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
-                (md5_hex, md5_b62, datetime.now(), name, extension)
+                (md5_hex, md5_b62, datetime.now().isoformat(), name, extension)
             )
             
             # Insert location
@@ -1128,7 +1200,7 @@ def read(input_file=None):
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO locations VALUES(NULL,?,?,?)",
-                    (md5_hex, path, datetime.now())
+                    (md5_hex, path, datetime.now().isoformat())
                 )
             
             conn.commit()
@@ -1156,6 +1228,165 @@ def backup(backup_path):
         print(f"backup created: {backup_path}", file=sys.stderr)
     except Exception as e:
         print(f"backup failed: {e}", file=sys.stderr)
+
+
+############ REMOTE SERVERS ############
+
+
+def remote_add(url, token=None):
+    """Add or update a remote lookup server."""
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT INTO remotes(url, token) VALUES(?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET token=excluded.token",
+        (url, token or "")
+    )
+
+    conn.commit()
+    print(url)
+
+
+def remote_rm(url):
+    """Remove a remote lookup server."""
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM remotes WHERE url=?", (url,))
+
+    if cur.rowcount == 0:
+        print("remote not found", file=sys.stderr)
+        return False
+
+    conn.commit()
+    return True
+
+
+def remote_list():
+    """List all registered remote lookup servers (URLs only)."""
+    conn = db()
+    cur = conn.cursor()
+
+    rows = cur.execute(
+        "SELECT url FROM remotes ORDER BY url"
+    ).fetchall()
+
+    for (url,) in rows:
+        print(url)
+
+
+def get_remote_servers():
+    """Return list of (url, token) tuples from remotes table."""
+    conn = db()
+    cur = conn.cursor()
+
+    return cur.execute(
+        "SELECT url, token FROM remotes ORDER BY url"
+    ).fetchall()
+
+
+def get_remote_token(url):
+    """Return token for a remote URL if it matches a registered server."""
+    for remote_url, token in get_remote_servers():
+        if url.startswith(remote_url) and token:
+            return token
+    return None
+
+
+def append_token(url, token):
+    """Append token query parameter to a URL if not already present."""
+    if not token:
+        return url
+    if "token=" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}token={token}"
+
+
+def remote_head_ok(url):
+    """Check if remote server has the file. Returns True if status 200."""
+    query_url = append_token(url, get_remote_token(url))
+    try:
+        req = urllib.request.Request(query_url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(resp.headers.get("Content-Disposition", ""))
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def add_remote_host_location(url, fid_b62):
+    """Add a remote host URL as a location for an existing fid."""
+    conn = db()
+    cur = conn.cursor()
+
+    md5_hex = base62_decode(fid_b62).hex()
+
+    cur.execute(
+        "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+        (md5_hex, url)
+    )
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO locations VALUES(NULL,?,?,?)",
+            (md5_hex, url, datetime.now().isoformat())
+        )
+        conn.commit()
+
+
+def register_remote_host_location(url, fid_b62):
+    """Register a new fid and remote location from a remote host.
+
+    The filename and extension are extracted from the Content-Disposition
+    header returned by a HEAD request. The MD5 is derived from the fid.
+    """
+    conn = db()
+    cur = conn.cursor()
+
+    md5_hex = base62_decode(fid_b62).hex()
+
+    # Query HEAD to discover filename
+    query_url = append_token(url, get_remote_token(url))
+
+    try:
+        req = urllib.request.Request(query_url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                return False
+            cd = resp.headers.get("Content-Disposition", "")
+            m = re.search(r'filename="([^"]+)"', cd)
+            filename = m.group(1) if m else fid_b62
+    except Exception as e:
+        print(f"remote lookup failed: {e}", file=sys.stderr)
+        return False
+
+    # Extract name and extension
+    if '.' in filename:
+        name, extension = filename.rsplit('.', 1)
+    else:
+        name = filename
+        extension = ''
+
+    # Insert file record
+    cur.execute(
+        "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
+        (md5_hex, fid_b62, datetime.now().isoformat(), name, extension)
+    )
+
+    # Insert location
+    cur.execute(
+        "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
+        (md5_hex, url)
+    )
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO locations VALUES(NULL,?,?,?)",
+            (md5_hex, url, datetime.now().isoformat())
+        )
+
+    conn.commit()
+    return True
 
 
 ############ CLI #######################
@@ -1190,10 +1421,13 @@ def main():
                 domain = args[idx + 1]
                 args = args[:idx] + args[idx + 2:]
         
+        allow_remote = "--allow-remote" in args
+        args = [a for a in args if a != "--allow-remote"]
+        
         if not args:
-            print("usage: fid resolve [--domain STRING] <fid> [<fid> ...]", file=sys.stderr)
+            print("usage: fid resolve [--domain STRING] [--allow-remote] <fid> [<fid> ...]", file=sys.stderr)
             return
-        resolve(args, domain=domain)
+        resolve(args, domain=domain, allow_remote=allow_remote)
 
     elif cmd == "verify":
 
@@ -1300,6 +1534,40 @@ def main():
             print("usage: fid backup <backup_path>", file=sys.stderr)
             return
         backup(sys.argv[2])
+
+    elif cmd == "remote":
+
+        if len(sys.argv) < 3:
+            remote_list()
+            return
+
+        subcmd = sys.argv[2]
+
+        if subcmd == "add":
+
+            if len(sys.argv) < 4:
+                print("usage: fid remote add <url> [<token>]", file=sys.stderr)
+                return
+
+            url = sys.argv[3]
+            token = sys.argv[4] if len(sys.argv) > 4 else None
+            remote_add(url, token)
+
+        elif subcmd == "rm":
+
+            if len(sys.argv) < 4:
+                print("usage: fid remote rm <url>", file=sys.stderr)
+                return
+
+            remote_rm(sys.argv[3])
+
+        elif subcmd == "list":
+
+            remote_list()
+
+        else:
+
+            print("unknown remote subcommand", file=sys.stderr)
 
     else:
 
