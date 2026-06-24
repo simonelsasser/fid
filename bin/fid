@@ -235,7 +235,7 @@ def download_temp(prefix, source):
         return tmp
 
     except:
-        print("download failed", file=sys.stderr)
+        print("download from remote location failed", file=sys.stderr)
         return None
 
 
