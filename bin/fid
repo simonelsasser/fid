@@ -8,13 +8,19 @@ import hashlib
 import urllib.request
 import subprocess
 import uuid
+import platform
 from datetime import datetime
 
 
 ################ CONFIG ################
 
-DB = os.path.expanduser("/Library/Application Support/fid/fid.db")
-CACHE_DIR = os.path.expanduser("/Library/Application Support/fid/cache")
+if platform.system() == "Darwin":
+    FID_HOME = "/Library/Application Support/fid"
+else:
+    FID_HOME = os.path.join(os.path.expanduser("~"), ".fid")
+
+DB = os.path.join(FID_HOME, "fid.db")
+CACHE_DIR = os.path.join(FID_HOME, "cache")
 
 KEEP_CACHE = True
 
