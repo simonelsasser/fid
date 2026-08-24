@@ -18,7 +18,7 @@ import shutil
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from fid_cli import (
+from fid import (
     db,
     lookup,
     base62_decode,
@@ -264,9 +264,9 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             return
         
         # Calculate MD5
-        md5 = hashlib.md5(content)
-        md5_bytes = md5.digest()
-        md5_hex = md5.hex()
+        md5_hash = hashlib.md5(content)
+        md5_bytes = md5_hash.digest()
+        md5_hex = md5_hash.hexdigest()
         
         md5_b62 = base62_encode(md5_bytes)
         
@@ -286,8 +286,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         try:
             with open(upload_path, "wb") as f:
                 f.write(content)
-            
-            # Register in fid database
+        except Exception as e:
+            self.send_error_response(500, f"cannot save file: {e}")
+            return
+        
+        # Register in fid database
+        try:
             fid = register_single(upload_path)
             
             if fid:
@@ -298,7 +302,9 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error_response(500, "failed to register file")
         except Exception as e:
-            self.send_error_response(500, f"cannot save file: {e}")
+            import traceback
+            traceback.print_exc()
+            self.send_error_response(500, f"failed to register: {e}")
     
     def handle_list(self):
         """Handle /list request."""
