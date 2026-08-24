@@ -358,7 +358,7 @@ def clean_filter(filename):
     sys.stdout.buffer.write(pointer)
 
 
-def smudge_filter():
+def smudge_filter(target_path=None):
     """
     Smudge filter: resolve fid locally or download from server, write content to stdout.
     
@@ -367,8 +367,10 @@ def smudge_filter():
     Workflow:
     1. Parse fid://... from stdin
     2. Try fid resolve locally
-    3. If found: copy from local path
-    4. If not found: download from server, register locally, copy to working dir
+    3. If found: copy from local path (overwrites target)
+    4. If not found: download from server, register locally, write to stdout
+    
+    Always overwrites target file - this is intentional to restore original version.
     """
     # Read fid pointer from stdin
     content = sys.stdin.read().strip()
@@ -395,7 +397,7 @@ def smudge_filter():
     local_path = resolve_fid_locally(fid)
     
     if local_path and os.path.exists(local_path):
-        # Step 3: Copy from local path
+        # Step 3: Copy from local path (always overwrite target)
         try:
             with open(local_path, "rb") as f:
                 file_content = f.read()
@@ -439,7 +441,7 @@ def smudge_filter():
         print(f"fid-git: warning: could not register downloaded file: {e}", file=sys.stderr)
         # Continue anyway - we still have the content
     
-    # Write content to stdout
+    # Write content to stdout (git will write to working directory)
     sys.stdout.buffer.write(downloaded)
 
 
