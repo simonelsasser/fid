@@ -400,14 +400,14 @@ def register(paths):
 
 
 def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, check_size=False):
-    """Resolve a single fid prefix to a path. Returns None if not found.
+    """Resolve a single fid prefix to a path. Returns path on success, None on error.
     
     If domain is provided, only return paths containing the domain string.
     If try_remote is True, query registered remote lookup servers when no
     local or cached remote location is available.
     If allow_remote is True, return remote URLs as-is without downloading
     or validating them.
-    If check_size is True, verify file size matches stored size (warns on mismatch).
+    If check_size is True, verify file size matches stored size.
     """
     conn = db()
 
@@ -434,13 +434,13 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
                     if register_remote_host_location(query_url, prefix):
                         return resolve_single(prefix, domain=domain, try_remote=False, allow_remote=allow_remote, check_size=check_size)
         
-        print("fid not found", file=sys.stderr)
+        print("ERROR:NOT_FOUND", file=sys.stderr)
 
         return None
 
     if len(matches) > 1:
 
-        print("fid not unique", file=sys.stderr)
+        print("ERROR:NOT_UNIQUE", file=sys.stderr)
 
         return None
 
@@ -479,9 +479,11 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
                         try:
                             current_size = os.path.getsize(val)
                             if current_size != stored_size:
-                                print(f"fid resolve: warning: size mismatch for {val} (expected {stored_size}, got {current_size})", file=sys.stderr)
+                                print("ERROR:SIZE_MISMATCH", file=sys.stderr)
+                                return None
                         except Exception as e:
-                            print(f"fid resolve: warning: cannot check size: {e}", file=sys.stderr)
+                            print("ERROR:IO_ERROR", file=sys.stderr)
+                            return None
                     return val
 
             else:
@@ -715,25 +717,24 @@ def update(args):
 
 
 def resolve(prefixes, domain=None, allow_remote=False, check_size=False):
-    """Resolve one or more fid prefixes to paths.
-    
-    If domain is provided, only print paths containing the domain string.
-    If allow_remote is True, return remote URLs as-is without downloading.
-    If check_size is True, verify file size matches stored size.
-    """
+    """Resolve one or more fid prefixes to paths. Returns 0 on success, 1 on error."""
+    has_error = False
     for prefix in prefixes:
         path = resolve_single(prefix.replace("fid://", ""), domain=domain, allow_remote=allow_remote, check_size=check_size)
         if path:
             print(path)
+        else:
+            has_error = True
+    return 1 if has_error else 0
 
 
 ############ ID #######################
 
 def fid_id_single(path, do_register=False, check_size=False):
-    """Get the fid for a single file. Returns None if not found.
+    """Get the fid for a single file. Returns fid on success, empty string on error.
     
     If check_size=True, verify that current file size matches stored size.
-    Warns if size mismatch but still returns fid.
+    Returns empty string on size mismatch.
     """
     conn = db()
 
@@ -756,6 +757,7 @@ def fid_id_single(path, do_register=False, check_size=False):
         ).fetchone()
         
         if not file_row:
+            print("ERROR:NOT_FOUND", file=sys.stderr)
             return ""
         
         md5_b62, stored_size = file_row
@@ -765,25 +767,35 @@ def fid_id_single(path, do_register=False, check_size=False):
             try:
                 current_size = os.path.getsize(path)
                 if current_size != stored_size:
-                    print(f"fid id: warning: size mismatch for {path} (expected {stored_size}, got {current_size})", file=sys.stderr)
+                    print("ERROR:SIZE_MISMATCH", file=sys.stderr)
+                    return ""
             except Exception as e:
-                print(f"fid id: warning: cannot check size: {e}", file=sys.stderr)
+                print("ERROR:IO_ERROR", file=sys.stderr)
+                return ""
 
         return md5_b62
 
     if do_register:
-        return register_single(path)
+        fid = register_single(path)
+        if not fid:
+            print("ERROR:REGISTER_FAILED", file=sys.stderr)
+        return fid
 
+    print("ERROR:NOT_FOUND", file=sys.stderr)
     return ""
 
 
 def fid_id(paths, do_register=False, check_size=False):
-    """Get fids for one or more files."""
+    """Get fids for one or more files. Returns 0 on success, 1 on error."""
     expanded = expand_paths(paths)
+    has_error = False
     for path in expanded:
         fid = fid_id_single(path, do_register=do_register, check_size=check_size)
         if fid:
             print(fid)
+        else:
+            has_error = True
+    return 1 if has_error else 0
 
 ############ VERIFY ####################
 
@@ -1700,8 +1712,9 @@ def main():
         
         if not args:
             print("usage: fid resolve [--domain STRING] [--allow-remote] [--check-size] <fid> [<fid> ...]", file=sys.stderr)
-            return
-        resolve(args, domain=domain, allow_remote=allow_remote, check_size=check_size)
+            sys.exit(1)
+        exit_code = resolve(args, domain=domain, allow_remote=allow_remote, check_size=check_size)
+        sys.exit(exit_code)
 
     elif cmd == "verify":
 
@@ -1763,8 +1776,9 @@ def main():
 
         if not paths:
             print("usage: fid id [--register] [--check-size] <path> [<path> ...]", file=sys.stderr)
-            return
-        fid_id(paths, do_register=do_register, check_size=check_size)
+            sys.exit(1)
+        exit_code = fid_id(paths, do_register=do_register, check_size=check_size)
+        sys.exit(exit_code)
 
     elif cmd == "purge-cache":
 
