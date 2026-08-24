@@ -1481,15 +1481,112 @@ def register_remote_host_location(url, fid_b62):
 ############ CLI #######################
 
 
+def print_help():
+    """Print help message with all available commands."""
+    print("""fid - File Identity Management
+
+USAGE:
+    fid <command> [options] [arguments]
+
+COMMANDS:
+    register <path> [<path> ...]
+        Register one or more files and print their fids
+
+    resolve [--domain STRING] [--allow-remote] <fid> [<fid> ...]
+        Resolve fid(s) to file path(s)
+        --domain STRING    Only return paths containing STRING
+        --allow-remote     Return remote URLs without downloading
+
+    verify [--bysize] <fid> [<fid> ...]
+        Verify file integrity by MD5 checksum
+        --bysize           Verify by file size instead (faster)
+
+    id [--register] <path> [<path> ...]
+        Get fid(s) for file(s)
+        --register         Register file if not found
+
+    add <fid> <path> [<path> ...]
+        Add path(s) to an existing fid
+
+    update <fid> <old_path> <new_path>
+        Update a path for an existing fid
+
+    list [--project NAME]
+        List all registered files in YAML format
+        --project NAME     Only show fids with matching project metadata
+
+    find <key=value>
+        Find fids by metadata key-value pair
+
+    meta set <fid> <key> <value>
+        Set metadata for a fid
+
+    meta get <fid>
+        Get all metadata for a fid
+
+    meta rm <fid> <key>
+        Remove metadata key from a fid
+
+    duplicates [--checksum]
+        Find fids with multiple local paths
+        --checksum         Verify duplicates by MD5 checksum
+
+    clean
+        Remove dead paths and orphaned fids
+
+    write [--domain STRING] [output_file]
+        Write all fids to CSV format
+        --domain STRING    Only write locations containing STRING
+
+    read [input_file]
+        Read fids from CSV format (stdin if no file)
+
+    cloudpull <url>
+        Download CSV from URL and import into database
+
+    backup <backup_path>
+        Create a backup copy of the fid database
+
+    purge-cache
+        Clear the download cache
+
+    remote
+        List all registered remote lookup servers
+
+    remote add <url> [<token>]
+        Add or update a remote lookup server
+
+    remote rm <url>
+        Remove a remote lookup server
+
+    help
+        Show this help message
+
+EXAMPLES:
+    fid register /path/to/file.txt
+    fid resolve ABC123...XYZ
+    fid verify --bysize ABC123...XYZ
+    fid id --register /path/to/file.txt
+    fid list --project myproject
+    fid duplicates --checksum
+""")
+
+
 def main():
 
     if len(sys.argv) < 2:
 
-        print("usage: fid <command>")
+        print_help()
 
         return
 
     cmd = sys.argv[1]
+
+    if cmd in ("help", "--help", "-h"):
+
+        print_help()
+
+        return
 
     if cmd == "register":
 
