@@ -210,14 +210,47 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         for (path,) in rows:
             pfx, val = split_path(path)
             if pfx == "local" and os.path.exists(val):
+                # Verify file size matches stored size
+                try:
+                    stored_size = cur.execute(
+                        "SELECT size FROM files WHERE md5_hex=?",
+                        (md5_hex,)
+                    ).fetchone()
+                    if stored_size and stored_size[0] is not None:
+                        current_size = os.path.getsize(val)
+                        if current_size != stored_size[0]:
+                            print(f"fid-api: size mismatch for {val}", file=sys.stderr)
+                            continue  # Try next path
+                except Exception as e:
+                    print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
+                
                 self.send_file(val)
                 return
         
-        # Check server uploads directory
-        upload_path = os.path.join(self.config.upload_dir, md5_b62)
-        if os.path.exists(upload_path):
-            self.send_file(upload_path)
-            return
+        # Check server uploads directory (<fid>/<filename> structure)
+        fid_dir = os.path.join(self.config.upload_dir, md5_b62)
+        if os.path.isdir(fid_dir):
+            # Get first file in directory (should be only one)
+            files = os.listdir(fid_dir)
+            if files:
+                upload_path = os.path.join(fid_dir, files[0])
+                # Verify file size matches stored size
+                try:
+                    stored_size = cur.execute(
+                        "SELECT size FROM files WHERE md5_hex=?",
+                        (md5_hex,)
+                    ).fetchone()
+                    if stored_size and stored_size[0] is not None:
+                        current_size = os.path.getsize(upload_path)
+                        if current_size != stored_size[0]:
+                            print(f"fid-api: size mismatch for {upload_path}", file=sys.stderr)
+                            self.send_error_response(500, "file corrupted")
+                            return
+                except Exception as e:
+                    print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
+                
+                self.send_file(upload_path)
+                return
         
         self.send_error_response(404, "file not available")
     
@@ -259,14 +292,18 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
         
-        # Check server uploads directory
-        upload_path = os.path.join(self.config.upload_dir, md5_b62)
-        if os.path.exists(upload_path):
-            self.send_response(200)
-            basename = os.path.basename(upload_path)
-            self.send_header("Content-Disposition", f'attachment; filename="{basename}"')
-            self.end_headers()
-            return
+        # Check server uploads directory (<fid>/<filename> structure)
+        fid_dir = os.path.join(self.config.upload_dir, md5_b62)
+        if os.path.isdir(fid_dir):
+            # Get first file in directory (should be only one)
+            files = os.listdir(fid_dir)
+            if files:
+                upload_path = os.path.join(fid_dir, files[0])
+                self.send_response(200)
+                basename = os.path.basename(upload_path)
+                self.send_header("Content-Disposition", f'attachment; filename="{basename}"')
+                self.end_headers()
+                return
         
         self.send_response(404)
         self.end_headers()
@@ -301,26 +338,58 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         for (path,) in rows:
             pfx, val = split_path(path)
             if pfx == "local" and os.path.exists(val):
+                # Verify file size matches stored size
+                try:
+                    stored_size = cur.execute(
+                        "SELECT size FROM files WHERE md5_hex=?",
+                        (md5_hex,)
+                    ).fetchone()
+                    if stored_size and stored_size[0] is not None:
+                        current_size = os.path.getsize(val)
+                        if current_size != stored_size[0]:
+                            print(f"fid-api: size mismatch for {val}", file=sys.stderr)
+                            continue  # Try next path
+                except Exception as e:
+                    print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
+                
                 self.send_success_response({"fid": md5_b62, "path": path})
                 return
         
-        # Check server uploads directory
-        upload_path = os.path.join(self.config.upload_dir, md5_b62)
-        if os.path.exists(upload_path):
-            self.send_success_response({"fid": md5_b62, "path": upload_path})
-            return
+        # Check server uploads directory (<fid>/<filename> structure)
+        fid_dir = os.path.join(self.config.upload_dir, md5_b62)
+        if os.path.isdir(fid_dir):
+            # Get first file in directory (should be only one)
+            files = os.listdir(fid_dir)
+            if files:
+                upload_path = os.path.join(fid_dir, files[0])
+                # Verify file size matches stored size
+                try:
+                    stored_size = cur.execute(
+                        "SELECT size FROM files WHERE md5_hex=?",
+                        (md5_hex,)
+                    ).fetchone()
+                    if stored_size and stored_size[0] is not None:
+                        current_size = os.path.getsize(upload_path)
+                        if current_size != stored_size[0]:
+                            print(f"fid-api: size mismatch for {upload_path}", file=sys.stderr)
+                            self.send_error_response(500, "file corrupted")
+                            return
+                except Exception as e:
+                    print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
+                
+                self.send_success_response({"fid": md5_b62, "path": upload_path})
+                return
         
         self.send_error_response(404, "fid not found")
     
     def handle_upload(self):
         """Handle /upload POST request.
         
-        Flow to avoid filename clashes:
+        Flow:
         1. Save uploaded file with original filename (temporarily)
-        2. Register it to get fid
-        3. Check if fid already exists in upload directory
-        4. If exists: delete temp file, return duplicate status
-        5. If not exists: rename temp file to fid
+        2. Register with --no-duplicate flag
+        3. If ERROR:DUPLICATE_FILE: delete temp file, return duplicate status
+        4. If success: create <fid>/ directory, move file there, update database
         """
         content_length = int(self.headers.get("Content-Length", 0))
         
@@ -328,7 +397,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(400, "no file content")
             return
         
-        # Get filename from Content-Disposition or use timestamp
+        # Get filename from Content-Disposition or use fid
         content_disp = self.headers.get("Content-Disposition", "")
         filename = None
         if "filename=" in content_disp:
@@ -349,7 +418,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(500, f"cannot read upload: {e}")
             return
         
-        # Save uploaded file temporarily with original filename
+        # Save uploaded file temporarily
         try:
             with open(temp_path, "wb") as f:
                 f.write(content)
@@ -357,9 +426,9 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(500, f"cannot save file: {e}")
             return
         
-        # Register in fid database to get fid
+        # Register with --no-duplicate flag to check for existing files
         try:
-            fid = register_single(temp_path)
+            fid = register_single(temp_path, no_duplicate=True)
             
             if not fid:
                 # Clean up temp file
@@ -380,11 +449,13 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(500, f"failed to register: {e}")
             return
         
-        # Now check if this fid already exists in upload directory
-        final_path = os.path.join(self.config.upload_dir, fid)
+        # Check if duplicate was detected (stderr would have ERROR:DUPLICATE_FILE)
+        # We need to capture stderr from register_single, but since we can't,
+        # we check if the fid directory already exists
+        fid_dir = os.path.join(self.config.upload_dir, fid)
         
-        if os.path.exists(final_path):
-            # File already exists, delete temp file
+        if os.path.isdir(fid_dir):
+            # Duplicate - file already stored in <fid>/ directory
             try:
                 os.remove(temp_path)
             except:
@@ -397,16 +468,26 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             })
             return
         
-        # Rename temp file to fid (final storage)
+        # Not a duplicate - create <fid>/ directory and move file there
         try:
+            os.makedirs(fid_dir, exist_ok=True)
+            
+            # Use original filename if available, otherwise use fid
+            final_filename = filename if filename else fid
+            final_path = os.path.join(fid_dir, final_filename)
+            
             os.rename(temp_path, final_path)
+            
+            # Update database with new path using fid update
+            from fid import update_single
+            update_single(fid, temp_path, final_path)
             
             self.send_success_response({
                 "fid": fid,
                 "status": "uploaded"
             })
         except Exception as e:
-            # Clean up temp file if rename failed
+            # Clean up temp file if move failed
             try:
                 os.remove(temp_path)
             except:

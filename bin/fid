@@ -277,8 +277,13 @@ def write_spotlight_metadata(path, fid):
 ############ REGISTER ##################
 
 
-def register_single(path):
-    """Register a single file and return its fid, or None on failure."""
+def register_single(path, no_duplicate=False):
+    """Register a single file and return its fid, or None on failure.
+    
+    If no_duplicate=True, check if valid path already exists for this fid
+    before adding the new location. Returns fid but writes ERROR:DUPLICATE_FILE
+    to stderr if duplicate found (new path not added to database).
+    """
     conn = db()
 
     path = normalize_path(path)
@@ -372,6 +377,29 @@ def register_single(path):
                     (md5_hex, cache_path, datetime.now())
                 )
 
+    # Check for duplicate if requested (before adding new path)
+    if no_duplicate:
+        # Check if any valid local path already exists for this fid
+        existing_paths = cur.execute(
+            "SELECT path FROM locations WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchall()
+        
+        for (existing_path,) in existing_paths:
+            pfx, val = split_path(existing_path)
+            if pfx == "local" and os.path.exists(val):
+                # Verify size matches
+                try:
+                    if os.path.getsize(val) == file_size:
+                        # Valid duplicate found - don't add new path
+                        print("ERROR:DUPLICATE_FILE", file=sys.stderr)
+                        return md5_b62
+                except:
+                    pass
+        
+        # No duplicate found, continue to add new path
+        # Fall through to add path logic below
+
     cur.execute(
         "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
         (md5_hex, path)
@@ -387,11 +415,11 @@ def register_single(path):
     return md5_b62
 
 
-def register(paths):
+def register(paths, no_duplicate=False):
     """Register one or more files/directories."""
     expanded = expand_paths(paths)
     for path in expanded:
-        fid = register_single(path)
+        fid = register_single(path, no_duplicate=no_duplicate)
         if fid:
             print(fid)
 
@@ -1559,8 +1587,9 @@ USAGE:
     fid <command> [options] [arguments]
 
 COMMANDS:
-    register <path> [<path> ...]
+    register [--no-duplicate] <path> [<path> ...]
         Register one or more files and print their fids
+        --no-duplicate     Check for existing paths, report ERROR:DUPLICATE_FILE if found
 
     resolve [--domain STRING] [--allow-remote] [--check-size] <fid> [<fid> ...]
         Resolve fid(s) to file path(s)
@@ -1687,10 +1716,13 @@ def main():
 
     if cmd == "register":
 
-        if len(sys.argv) < 3:
-            print("usage: fid register <path> [<path> ...]", file=sys.stderr)
+        no_duplicate = "--no-duplicate" in sys.argv
+        paths = [arg for arg in sys.argv[2:] if arg != "--no-duplicate"]
+        
+        if len(paths) < 1:
+            print("usage: fid register [--no-duplicate] <path> [<path> ...]", file=sys.stderr)
             return
-        register(sys.argv[2:])
+        register(paths, no_duplicate=no_duplicate)
 
     elif cmd == "resolve":
 
