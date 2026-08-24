@@ -26,6 +26,8 @@ KEEP_CACHE = True
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
+__version__ = "0.1.0"
+
 ########################################
 
 
@@ -1562,6 +1564,9 @@ COMMANDS:
     help
         Show this help message
 
+    --version, -v
+        Show version number
+
 EXAMPLES:
     fid register /path/to/file.txt
     fid resolve ABC123...XYZ
@@ -1585,6 +1590,12 @@ def main():
     if cmd in ("help", "--help", "-h"):
 
         print_help()
+
+        return
+
+    if cmd in ("--version", "-v"):
+
+        print(f"fid {__version__}")
 
         return
 
