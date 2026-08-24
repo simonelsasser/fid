@@ -309,8 +309,7 @@ def register_single(path):
     else:
         extension = ''
 
-    if prefix != "local":
-        write_spotlight_metadata(filepath, md5_b62)
+    write_spotlight_metadata(filepath, md5_b62)
 
     cur = conn.cursor()
 
@@ -329,7 +328,7 @@ def register_single(path):
 
         cur.execute(
             "INSERT INTO files VALUES (?,?,?,?,?)",
-            (md5_hex, md5_b62, datetime.now().isoformat(), name, extension)
+            (md5_hex, md5_b62, datetime.now(), name, extension)
         )
 
 
@@ -340,6 +339,8 @@ def register_single(path):
 
             os.makedirs(os.path.join(CACHE_DIR, md5_b62), exist_ok=True)
             os.rename(filepath, cache_path)
+            
+            write_spotlight_metadata(cache_path, md5_b62)
 
             cur.execute(
                 "SELECT 1 FROM locations WHERE md5_hex=? AND path=?",
@@ -348,7 +349,7 @@ def register_single(path):
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO locations VALUES(NULL,?,?,?)",
-                    (md5_hex, cache_path, datetime.now().isoformat())
+                    (md5_hex, cache_path, datetime.now())
                 )
 
     cur.execute(
@@ -358,7 +359,7 @@ def register_single(path):
     if not cur.fetchone():
         cur.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, path, datetime.now().isoformat())
+            (md5_hex, path, datetime.now())
         )
 
     conn.commit()
@@ -502,7 +503,7 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False):
 
         conn.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, cache_path, datetime.now().isoformat())
+            (md5_hex, cache_path, datetime.now())
         )
 
         conn.commit()
@@ -566,7 +567,7 @@ def add_single(fid_prefix, path):
     # Add the location
     cur.execute(
         "INSERT INTO locations VALUES(NULL,?,?,?)",
-        (md5_hex, path, datetime.now().isoformat())
+        (md5_hex, path, datetime.now())
     )
     
     conn.commit()
@@ -688,7 +689,7 @@ def resolve(prefixes, domain=None, allow_remote=False):
 
 ############ ID #######################
 
-def fid_id_single(path):
+def fid_id_single(path, do_register=False):
     """Get the fid for a single file. Returns None if not found."""
     conn = db()
 
@@ -712,14 +713,17 @@ def fid_id_single(path):
 
         return md5_b62
 
+    if do_register:
+        return register_single(path)
+
     return ""
 
 
-def fid_id(paths):
+def fid_id(paths, do_register=False):
     """Get fids for one or more files."""
     expanded = expand_paths(paths)
     for path in expanded:
-        fid = fid_id_single(path)
+        fid = fid_id_single(path, do_register=do_register)
         if fid:
             print(fid)
 
@@ -959,32 +963,111 @@ def yaml_out(project=None):
 
 
 def clean():
-    """Remove all fids without any locations."""
+    """Check local paths, remove nonexistent ones, and delete orphaned fids."""
     conn = db()
     cur = conn.cursor()
 
-    # Find all fids with no locations
-    orphaned = cur.execute(
-        """
-        SELECT md5_hex, md5_base62 FROM files
-        WHERE md5_hex NOT IN (SELECT md5_hex FROM locations)
-        """
+    paths_removed = 0
+    fids_with_valid = set()
+    orphaned_hexes = set()
+
+    all_files = cur.execute(
+        "SELECT md5_hex, md5_base62 FROM files"
     ).fetchall()
 
-    if not orphaned:
-        print("no orphaned fids found", file=sys.stderr)
-        return
+    for md5_hex, md5_b62 in all_files:
+        locations = cur.execute(
+            "SELECT id, path FROM locations WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchall()
 
-    count = 0
-    for md5_hex, md5_b62 in orphaned:
-        # Delete metadata for this fid
+        has_valid = False
+
+        for loc_id, path in locations:
+            pfx, val = split_path(path)
+
+            if pfx == "local":
+                if os.path.exists(val):
+                    has_valid = True
+                else:
+                    cur.execute("DELETE FROM locations WHERE id=?", (loc_id,))
+                    paths_removed += 1
+
+            else:
+                has_valid = True
+
+        if has_valid:
+            fids_with_valid.add(md5_hex)
+        else:
+            orphaned_hexes.add(md5_hex)
+
+    for md5_hex in orphaned_hexes:
         cur.execute("DELETE FROM metadata WHERE md5_hex=?", (md5_hex,))
-        # Delete the file entry
         cur.execute("DELETE FROM files WHERE md5_hex=?", (md5_hex,))
-        count += 1
 
     conn.commit()
-    print(f"removed {count} orphaned fid(s)", file=sys.stderr)
+
+    print(f"{len(fids_with_valid)} fids with valid path(s), {paths_removed} paths removed, {len(orphaned_hexes)} orphan fids removed", file=sys.stderr)
+
+############ DUPLICATES ################
+
+
+def duplicates(checksum=False):
+    """Find fids with multiple local paths."""
+    conn = db()
+    cur = conn.cursor()
+
+    all_files = cur.execute(
+        "SELECT md5_hex, md5_base62 FROM files"
+    ).fetchall()
+
+    for md5_hex, md5_b62 in all_files:
+        locations = cur.execute(
+            "SELECT id, path FROM locations WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchall()
+
+        local_existing = []
+        for loc_id, path in locations:
+            pfx, val = split_path(path)
+            if pfx == "local":
+                if os.path.exists(val):
+                    local_existing.append((loc_id, val))
+                else:
+                    cur.execute("DELETE FROM locations WHERE id=?", (loc_id,))
+
+        if len(local_existing) < 2:
+            conn.commit()
+            continue
+
+        if not checksum:
+            sizes = set()
+            for _, val in local_existing:
+                try:
+                    sizes.add(os.path.getsize(val))
+                except OSError:
+                    sizes.add(-1)
+
+            if len(sizes) == 1 and -1 not in sizes:
+                for _, val in local_existing:
+                    print(f"{md5_b62}\t{val}")
+                conn.commit()
+                continue
+
+        verified = []
+        for loc_id, val in local_existing:
+            if md5_file(val).hex() == md5_hex:
+                verified.append((loc_id, val))
+            else:
+                print(f"MISMATCH {md5_b62} {val}", file=sys.stderr)
+                cur.execute("DELETE FROM locations WHERE id=?", (loc_id,))
+
+        if len(verified) >= 2:
+            for _, val in verified:
+                print(f"{md5_b62}\t{val}")
+
+        conn.commit()
+
 
 ############ CLOUDPULL #################
 
@@ -1195,7 +1278,7 @@ def read(input_file=None):
         try:
             cur.execute(
                 "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
-                (md5_hex, md5_b62, datetime.now().isoformat(), name, extension)
+                (md5_hex, md5_b62, datetime.now(), name, extension)
             )
             
             # Insert location
@@ -1206,7 +1289,7 @@ def read(input_file=None):
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO locations VALUES(NULL,?,?,?)",
-                    (md5_hex, path, datetime.now().isoformat())
+                    (md5_hex, path, datetime.now())
                 )
             
             conn.commit()
@@ -1336,7 +1419,7 @@ def add_remote_host_location(url, fid_b62):
     if not cur.fetchone():
         cur.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, url, datetime.now().isoformat())
+            (md5_hex, url, datetime.now())
         )
         conn.commit()
 
@@ -1377,7 +1460,7 @@ def register_remote_host_location(url, fid_b62):
     # Insert file record
     cur.execute(
         "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
-        (md5_hex, fid_b62, datetime.now().isoformat(), name, extension)
+        (md5_hex, fid_b62, datetime.now(), name, extension)
     )
 
     # Insert location
@@ -1388,7 +1471,7 @@ def register_remote_host_location(url, fid_b62):
     if not cur.fetchone():
         cur.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
-            (md5_hex, url, datetime.now().isoformat())
+            (md5_hex, url, datetime.now())
         )
 
     conn.commit()
@@ -1482,12 +1565,20 @@ def main():
 
         clean()
 
+    elif cmd == "duplicates":
+
+        checksum = "--checksum" in sys.argv
+        duplicates(checksum=checksum)
+
     elif cmd == "id":
 
-        if len(sys.argv) < 3:
-            print("usage: fid id <path> [<path> ...]", file=sys.stderr)
+        do_register = "--register" in sys.argv
+        paths = [arg for arg in sys.argv[2:] if arg != "--register"]
+
+        if not paths:
+            print("usage: fid id [--register] <path> [<path> ...]", file=sys.stderr)
             return
-        fid_id(sys.argv[2:])
+        fid_id(paths, do_register=do_register)
 
     elif cmd == "purge-cache":
 
