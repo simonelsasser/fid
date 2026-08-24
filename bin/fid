@@ -26,7 +26,7 @@ KEEP_CACHE = True
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 ########################################
 
@@ -1562,6 +1562,10 @@ COMMANDS:
     remote rm <url>
         Remove a remote lookup server
 
+    git init
+        Initialize git filter for current repository
+        Sets up .fidconfig and configures git to use fid for large files
+
     help
         Show this help message
 
@@ -1779,6 +1783,33 @@ def main():
         else:
 
             print("unknown remote subcommand", file=sys.stderr)
+
+    elif cmd == "git":
+
+        if len(sys.argv) < 3:
+            print("usage: fid git <subcommand>", file=sys.stderr)
+            print("subcommands:", file=sys.stderr)
+            print("  init    Initialize git filter for current repository", file=sys.stderr)
+            return
+
+        subcmd = sys.argv[2]
+
+        if subcmd == "init":
+            # Run fid_git.py init
+            import subprocess
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            fid_git_path = os.path.join(script_dir, "fid_git.py")
+            
+            if not os.path.exists(fid_git_path):
+                print("error: fid_git.py not found", file=sys.stderr)
+                sys.exit(1)
+            
+            result = subprocess.run([sys.executable, fid_git_path, "init"])
+            sys.exit(result.returncode)
+
+        else:
+            print(f"unknown git subcommand: {subcmd}", file=sys.stderr)
+            print("use 'fid git' to see available subcommands", file=sys.stderr)
 
     else:
 
