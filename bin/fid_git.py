@@ -23,6 +23,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Add to path to import fid module
 sys.path.insert(0, SCRIPT_DIR)
 
+# Import register_single from fid
+from fid import register_single
+
 
 def find_config(repo_root):
     """Find and load .fidconfig from repo root."""
@@ -192,32 +195,163 @@ def validate_fid(fid_string):
     return True
 
 
+def get_fid_for_file(filepath):
+    """Get fid for a file using fid id --register logic.
+    
+    Tries to get existing fid for the file path.
+    If not found, registers the file and returns the new fid.
+    """
+    import subprocess
+    
+    try:
+        # Run: fid id --register <filepath>
+        result = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, "fid"), "id", "--register", filepath],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout for large files
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            fid = result.stdout.strip()
+            # Validate it's a proper fid
+            if validate_fid(f"fid://{fid}"):
+                return fid
+        
+        return None
+        
+    except Exception as e:
+        print(f"fid-git: error getting fid for {filepath}: {e}", file=sys.stderr)
+        return None
+
+
+def check_fid_on_server(fid, config, auth_key):
+    """Check if fid exists on server via /resolve endpoint.
+    
+    Returns True if fid exists on server, False otherwise.
+    """
+    import urllib.request
+    
+    server_url = get_server_url(config)
+    if not server_url:
+        return False
+    
+    server_url = server_url.rstrip("/")
+    resolve_url = f"{server_url}/resolve?fid={fid}"
+    
+    try:
+        req = urllib.request.Request(resolve_url)
+        
+        if auth_key:
+            req.add_header("Authorization", f"Bearer {auth_key}")
+        
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            # 200 OK means fid exists
+            return resp.status == 200
+            
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        print(f"fid-git: server error checking fid: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"fid-git: error checking fid on server: {e}", file=sys.stderr)
+        return False
+
+
+def resolve_fid_locally(fid):
+    """Resolve fid to local path using fid resolve.
+    
+    Returns local file path if found, None otherwise.
+    """
+    import subprocess
+    
+    try:
+        result = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, "fid"), "resolve", f"fid://{fid}"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            path = result.stdout.strip()
+            if os.path.exists(path):
+                return path
+        
+        return None
+        
+    except Exception as e:
+        print(f"fid-git: error resolving fid locally: {e}", file=sys.stderr)
+        return None
+
+
+def copy_file(src, dst):
+    """Copy file from src to dst, creating directories as needed."""
+    import shutil
+    
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        return True
+    except Exception as e:
+        print(f"fid-git: error copying file: {e}", file=sys.stderr)
+        return False
+
+
 def clean_filter(filename):
     """
-    Clean filter: read file from stdin, upload to server, write fid pointer to stdout.
+    Clean filter: get fid for file, check server, upload if needed, write fid pointer.
     
     Git calls this when adding files to the index.
-    """
-    # Read file content from stdin
-    content = sys.stdin.buffer.read()
     
+    Workflow:
+    1. Get fid for file (calculate or retrieve from DB)
+    2. Check if fid exists on server via /resolve
+    3. If exists: skip upload, just output fid://...
+    4. If not exists: upload, verify fid matches, output fid://...
+    """
     # Get repo root and config
     repo_root = get_repo_root()
     if not repo_root:
         # Not in a git repo, pass through
-        sys.stdout.buffer.write(content)
+        sys.stdout.buffer.write(sys.stdin.buffer.read())
         return
     
     config = find_config(repo_root)
     if not config:
         # No .fidconfig, pass through
-        sys.stdout.buffer.write(content)
+        sys.stdout.buffer.write(sys.stdin.buffer.read())
         return
     
     auth_key = get_auth_key(config, repo_root)
     
-    # Upload to server
-    fid = upload_to_server(content, filename, config, auth_key)
+    # Get absolute path of file being added
+    if filename and not os.path.isabs(filename):
+        filepath = os.path.join(repo_root, filename)
+    else:
+        filepath = filename
+    
+    # Step 1: Get fid for file (from DB or register)
+    fid = get_fid_for_file(filepath) if filepath else None
+    
+    if not fid:
+        # Fallback: read content and upload directly
+        content = sys.stdin.buffer.read()
+        fid = upload_to_server(content, filename, config, auth_key)
+    else:
+        # Step 2: Check if fid exists on server
+        exists_on_server = check_fid_on_server(fid, config, auth_key)
+        
+        if not exists_on_server:
+            # Step 4: Upload file to server
+            content = sys.stdin.buffer.read()
+            uploaded_fid = upload_to_server(content, filename, config, auth_key)
+            
+            # Verify uploaded fid matches
+            if uploaded_fid != fid:
+                print(f"fid-git: error: uploaded fid {uploaded_fid} doesn't match local fid {fid}", file=sys.stderr)
+                sys.exit(1)
     
     # Write fid pointer to stdout
     pointer = f"fid://{fid}\n".encode()
@@ -226,9 +360,15 @@ def clean_filter(filename):
 
 def smudge_filter():
     """
-    Smudge filter: read fid pointer from stdin, download from server, write content to stdout.
+    Smudge filter: resolve fid locally or download from server, write content to stdout.
     
     Git calls this when checking out files from the index.
+    
+    Workflow:
+    1. Parse fid://... from stdin
+    2. Try fid resolve locally
+    3. If found: copy from local path
+    4. If not found: download from server, register locally, copy to working dir
     """
     # Read fid pointer from stdin
     content = sys.stdin.read().strip()
@@ -241,24 +381,37 @@ def smudge_filter():
     
     fid = content[6:]  # Remove "fid://" prefix
     
-    # Get repo root and config
+    # Get repo root
     repo_root = get_repo_root()
     if not repo_root:
-        # Not in a git repo, can't download
-        print(f"fid-git: warning: not in git repo, cannot download {fid}", file=sys.stderr)
+        # Not in a git repo, can't resolve
+        print(f"fid-git: warning: not in git repo, cannot resolve {fid}", file=sys.stderr)
         sys.stdout.write(content + "\n")
         return
     
     config = find_config(repo_root)
+    
+    # Step 2: Try fid resolve locally
+    local_path = resolve_fid_locally(fid)
+    
+    if local_path and os.path.exists(local_path):
+        # Step 3: Copy from local path
+        try:
+            with open(local_path, "rb") as f:
+                file_content = f.read()
+            sys.stdout.buffer.write(file_content)
+            return
+        except Exception as e:
+            print(f"fid-git: warning: could not read local file {local_path}: {e}", file=sys.stderr)
+            # Fall through to download
+    
+    # Step 4: Download from server
     if not config:
-        # No .fidconfig, can't download
         print(f"fid-git: warning: no .fidconfig, cannot download {fid}", file=sys.stderr)
         sys.stdout.write(content + "\n")
         return
     
     auth_key = get_auth_key(config, repo_root)
-    
-    # Download from server
     downloaded = download_from_server(fid, config, auth_key)
     
     if downloaded is None:
@@ -266,6 +419,25 @@ def smudge_filter():
         print(f"fid-git: warning: could not download {fid}, file will be missing", file=sys.stderr)
         sys.stdout.write(content + "\n")
         return
+    
+    # Register downloaded file locally (so future resolves work)
+    # Save to cache directory
+    cache_dir = os.path.join(repo_root, ".fid", "cache", fid)
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # We need a filename - use fid as name
+    cache_path = os.path.join(cache_dir, fid)
+    
+    try:
+        with open(cache_path, "wb") as f:
+            f.write(downloaded)
+        
+        # Register in fid database
+        register_single(cache_path)
+        
+    except Exception as e:
+        print(f"fid-git: warning: could not register downloaded file: {e}", file=sys.stderr)
+        # Continue anyway - we still have the content
     
     # Write content to stdout
     sys.stdout.buffer.write(downloaded)
