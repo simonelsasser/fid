@@ -309,7 +309,10 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
     
     def handle_resolve(self, params):
-        """Handle /resolve?fid=<fid> request."""
+        """Handle /resolve?fid=<fid> request.
+        
+        Returns download URL instead of internal path for security.
+        """
         fid_list = params.get("fid", [])
         
         if not fid_list:
@@ -328,7 +331,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         
         md5_hex, md5_b62 = matches[0]
         
-        # Find local path
+        # Construct download URL (never expose internal paths)
+        # Get server URL from request
+        host = self.headers.get("Host", "localhost")
+        download_url = f"http://{host}/?fid={md5_b62}"
+        
+        # Find local path (just to verify file exists)
         cur = conn.cursor()
         rows = cur.execute(
             "SELECT path FROM locations WHERE md5_hex=?",
@@ -352,7 +360,8 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
                 
-                self.send_success_response({"fid": md5_b62, "path": path})
+                # File exists, return download URL
+                self.send_success_response({"fid": md5_b62, "url": download_url})
                 return
         
         # Check server uploads directory (<fid>/<filename> structure)
@@ -377,7 +386,8 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
                 
-                self.send_success_response({"fid": md5_b62, "path": upload_path})
+                # File exists, return download URL
+                self.send_success_response({"fid": md5_b62, "url": download_url})
                 return
         
         self.send_error_response(404, "fid not found")
