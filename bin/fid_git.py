@@ -16,6 +16,7 @@ import sys
 import json
 import subprocess
 import hashlib
+import urllib.parse
 
 # Script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -99,8 +100,22 @@ def get_repo_root():
         return None
 
 
-def upload_to_server(content, filename, config, auth_key):
-    """Upload content to fid server and return fid."""
+def upload_to_server(content, filename, fid, config, auth_key):
+    """Upload content to fid server with fid and filename.
+    
+    Args:
+        content: File content (bytes)
+        filename: Original filename (string)
+        fid: Pre-calculated fid (string, 22 chars)
+        config: Server configuration
+        auth_key: Authentication key (optional)
+    
+    Returns:
+        fid on success
+    
+    Raises:
+        SystemExit: On upload failure
+    """
     import urllib.request
     
     server_url = get_server_url(config)
@@ -111,8 +126,8 @@ def upload_to_server(content, filename, config, auth_key):
     # Ensure server URL doesn't have trailing slash
     server_url = server_url.rstrip("/")
     
-    # Upload to server
-    upload_url = f"{server_url}/upload"
+    # Upload to server with fid and filename as query parameters
+    upload_url = f"{server_url}/upload?fid={fid}&filename={urllib.parse.quote(filename or '')}"
     
     try:
         req = urllib.request.Request(
@@ -121,10 +136,6 @@ def upload_to_server(content, filename, config, auth_key):
             method="POST"
         )
         req.add_header("Content-Type", "application/octet-stream")
-        
-        # Add filename to Content-Disposition
-        if filename:
-            req.add_header("Content-Disposition", f'attachment; filename="{filename}"')
         
         # Add auth header if available
         if auth_key:
@@ -141,6 +152,10 @@ def upload_to_server(content, filename, config, auth_key):
                 print(f"fid-git: upload failed: {result}", file=sys.stderr)
                 sys.exit(1)
                 
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        print(f"fid-git: upload failed (HTTP {e.code}): {error_body}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"fid-git: upload failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -301,15 +316,16 @@ def copy_file(src, dst):
 
 def clean_filter(filename):
     """
-    Clean filter: get fid for file, check server, upload if needed, write fid pointer.
+    Clean filter: get fid for file, upload to server with fid+filename, write fid pointer.
     
     Git calls this when adding files to the index.
     
     Workflow:
     1. Get fid for file (calculate or retrieve from DB)
-    2. Check if fid exists on server via /resolve
-    3. If exists: skip upload, just output fid://...
-    4. If not exists: upload, verify fid matches, output fid://...
+    2. Read file content
+    3. Upload to server with fid and filename as query parameters
+    4. Server validates fid matches content, checks for duplicates
+    5. Output fid://... pointer
     """
     # Get repo root and config
     repo_root = get_repo_root()
@@ -336,22 +352,19 @@ def clean_filter(filename):
     fid = get_fid_for_file(filepath) if filepath else None
     
     if not fid:
-        # Fallback: read content and upload directly
+        # Fallback: read content and calculate fid
         content = sys.stdin.buffer.read()
-        fid = upload_to_server(content, filename, config, auth_key)
-    else:
-        # Step 2: Check if fid exists on server
-        exists_on_server = check_fid_on_server(fid, config, auth_key)
+        import hashlib
+        md5_hash = hashlib.md5(content)
+        from fid import base62_encode
+        fid = base62_encode(md5_hash.digest())
         
-        if not exists_on_server:
-            # Step 4: Upload file to server
-            content = sys.stdin.buffer.read()
-            uploaded_fid = upload_to_server(content, filename, config, auth_key)
-            
-            # Verify uploaded fid matches
-            if uploaded_fid != fid:
-                print(f"fid-git: error: uploaded fid {uploaded_fid} doesn't match local fid {fid}", file=sys.stderr)
-                sys.exit(1)
+        # Upload with calculated fid
+        upload_to_server(content, filename, fid, config, auth_key)
+    else:
+        # Read content and upload with known fid
+        content = sys.stdin.buffer.read()
+        upload_to_server(content, filename, fid, config, auth_key)
     
     # Write fid pointer to stdout
     pointer = f"fid://{fid}\n".encode()
@@ -367,8 +380,9 @@ def smudge_filter(target_path=None):
     Workflow:
     1. Parse fid://... from stdin
     2. Try fid resolve locally
-    3. If found: copy from local path (overwrites target)
-    4. If not found: download from server, register locally, write to stdout
+    3. If found: copy from local path
+    4. If not found: download from server
+    5. Fail loudly with clear error if all attempts fail
     
     Always overwrites target file - this is intentional to restore original version.
     """
@@ -387,8 +401,8 @@ def smudge_filter(target_path=None):
     repo_root = get_repo_root()
     if not repo_root:
         # Not in a git repo, can't resolve
-        print(f"fid-git: warning: not in git repo, cannot resolve {fid}", file=sys.stderr)
-        sys.stdout.write(content + "\n")
+        print(f"fid-git: ERROR:NOT_IN_REPO - cannot resolve {fid}", file=sys.stderr)
+        # Output empty (file will be missing)
         return
     
     config = find_config(repo_root)
@@ -397,29 +411,37 @@ def smudge_filter(target_path=None):
     local_path = resolve_fid_locally(fid)
     
     if local_path and os.path.exists(local_path):
-        # Step 3: Copy from local path (always overwrite target)
+        # Step 3: Copy from local path
         try:
             with open(local_path, "rb") as f:
                 file_content = f.read()
             sys.stdout.buffer.write(file_content)
             return
         except Exception as e:
-            print(f"fid-git: warning: could not read local file {local_path}: {e}", file=sys.stderr)
+            print(f"fid-git: ERROR:LOCAL_READ_FAILED - {local_path}: {e}", file=sys.stderr)
             # Fall through to download
     
     # Step 4: Download from server
     if not config:
-        print(f"fid-git: warning: no .fidconfig, cannot download {fid}", file=sys.stderr)
-        sys.stdout.write(content + "\n")
+        print(f"fid-git: ERROR:NO_FIDCONFIG - cannot download {fid} (no .fidconfig found)", file=sys.stderr)
+        # Output empty (file will be missing)
+        return
+    
+    # Check if server URL is configured
+    server_url = get_server_url(config)
+    if not server_url:
+        print(f"fid-git: ERROR:NO_SERVER_URL - cannot download {fid} (server not configured in .fidconfig)", file=sys.stderr)
+        # Output empty (file will be missing)
         return
     
     auth_key = get_auth_key(config, repo_root)
     downloaded = download_from_server(fid, config, auth_key)
     
     if downloaded is None:
-        # Download failed, output fid pointer as-is
-        print(f"fid-git: warning: could not download {fid}, file will be missing", file=sys.stderr)
-        sys.stdout.write(content + "\n")
+        # Download failed
+        print(f"fid-git: ERROR:DOWNLOAD_FAILED - could not download {fid} from {server_url}", file=sys.stderr)
+        print(f"fid-git: HINT: Check that server is running and fid exists: curl {server_url}/resolve?fid={fid}", file=sys.stderr)
+        # Output empty (file will be missing)
         return
     
     # Register downloaded file locally (so future resolves work)
@@ -438,7 +460,7 @@ def smudge_filter(target_path=None):
         register_single(cache_path)
         
     except Exception as e:
-        print(f"fid-git: warning: could not register downloaded file: {e}", file=sys.stderr)
+        print(f"fid-git: ERROR:REGISTER_FAILED - could not register downloaded file: {e}", file=sys.stderr)
         # Continue anyway - we still have the content
     
     # Write content to stdout (git will write to working directory)

@@ -383,33 +383,41 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.send_error_response(404, "fid not found")
     
     def handle_upload(self):
-        """Handle /upload POST request.
+        """Handle /upload POST request with fid and filename from query parameters.
         
         Flow:
-        1. Save uploaded file with original filename (temporarily)
-        2. Register with --no-duplicate flag
-        3. If ERROR:DUPLICATE_FILE: delete temp file, return duplicate status
-        4. If success: create <fid>/ directory, move file there, update database
+        1. Get fid and filename from query parameters
+        2. Read content and calculate fid
+        3. Verify calculated fid matches provided fid (security check)
+        4. Check if fid already exists on server (duplicate detection)
+        5. If duplicate: delete content, return duplicate status
+        6. If new: save as <fid>/<filename>, register in database
         """
+        # Parse query parameters
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        
+        # Get fid from query parameter
+        fid_list = params.get("fid", [])
+        if not fid_list:
+            self.send_error_response(400, "missing fid parameter")
+            return
+        provided_fid = fid_list[0]
+        
+        # Validate fid format
+        if len(provided_fid) != 22:
+            self.send_error_response(400, "invalid fid format")
+            return
+        
+        # Get filename from query parameter
+        filename_list = params.get("filename", [])
+        filename = filename_list[0] if filename_list else None
+        
         content_length = int(self.headers.get("Content-Length", 0))
         
         if content_length == 0:
             self.send_error_response(400, "no file content")
             return
-        
-        # Get filename from Content-Disposition or use fid
-        content_disp = self.headers.get("Content-Disposition", "")
-        filename = None
-        if "filename=" in content_disp:
-            import re
-            m = re.search(r'filename="([^"]+)"', content_disp)
-            if m:
-                filename = m.group(1)
-        
-        # Use timestamp for temp filename to avoid collisions
-        import time
-        temp_filename = f".upload_{int(time.time() * 1000)}_{filename or 'tmp'}"
-        temp_path = os.path.join(self.config.upload_dir, temp_filename)
         
         # Read uploaded content
         try:
@@ -418,81 +426,97 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(500, f"cannot read upload: {e}")
             return
         
-        # Save uploaded file temporarily
-        try:
-            with open(temp_path, "wb") as f:
-                f.write(content)
-        except Exception as e:
-            self.send_error_response(500, f"cannot save file: {e}")
+        # Calculate fid from content and verify it matches provided fid
+        import hashlib
+        md5_hash = hashlib.md5(content)
+        md5_bytes = md5_hash.digest()
+        md5_hex = md5_hash.hexdigest()
+        from fid import base62_encode
+        calculated_fid = base62_encode(md5_bytes)
+        
+        if calculated_fid != provided_fid:
+            # Fid mismatch - reject upload (security check)
+            print(f"fid-api: fid mismatch - provided={provided_fid}, calculated={calculated_fid}", file=sys.stderr)
+            self.send_error_response(400, "FID_MISMATCH")
             return
         
-        # Register with --no-duplicate flag to check for existing files
-        try:
-            fid = register_single(temp_path, no_duplicate=True)
-            
-            if not fid:
-                # Clean up temp file
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-                self.send_error_response(500, "failed to register file")
-                return
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            # Clean up temp file
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-            self.send_error_response(500, f"failed to register: {e}")
-            return
-        
-        # Check if duplicate was detected (stderr would have ERROR:DUPLICATE_FILE)
-        # We need to capture stderr from register_single, but since we can't,
-        # we check if the fid directory already exists
-        fid_dir = os.path.join(self.config.upload_dir, fid)
+        # Check if fid already exists on server (duplicate detection)
+        fid_dir = os.path.join(self.config.upload_dir, provided_fid)
         
         if os.path.isdir(fid_dir):
-            # Duplicate - file already stored in <fid>/ directory
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-            
-            self.send_success_response({
-                "fid": fid,
-                "status": "duplicate",
-                "message": "file already exists on server"
-            })
-            return
+            # Duplicate - file already exists
+            files = os.listdir(fid_dir)
+            if files:
+                self.send_success_response({
+                    "fid": provided_fid,
+                    "status": "duplicate",
+                    "message": "file already exists on server"
+                })
+                return
         
-        # Not a duplicate - create <fid>/ directory and move file there
+        # Check if fid exists in database (another form of duplicate)
+        conn = db()
+        cur = conn.cursor()
+        
+        existing = cur.execute(
+            "SELECT md5_base62 FROM files WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchone()
+        
+        if existing:
+            # Fid exists in database - check if any valid path exists
+            paths = cur.execute(
+                "SELECT path FROM locations WHERE md5_hex=?",
+                (md5_hex,)
+            ).fetchall()
+            
+            for (path,) in paths:
+                pfx, val = split_path(path)
+                if pfx == "local" and os.path.exists(val):
+                    try:
+                        if os.path.getsize(val) == len(content):
+                            # Valid duplicate found
+                            self.send_success_response({
+                                "fid": provided_fid,
+                                "status": "duplicate",
+                                "message": "file already exists on server"
+                            })
+                            return
+                    except:
+                        pass
+        
+        # Not a duplicate - save file in <fid>/<filename> structure
         try:
             os.makedirs(fid_dir, exist_ok=True)
             
-            # Use original filename if available, otherwise use fid
-            final_filename = filename if filename else fid
+            # Use provided filename or fallback to fid
+            final_filename = filename if filename else provided_fid
             final_path = os.path.join(fid_dir, final_filename)
             
-            os.rename(temp_path, final_path)
+            # Write file
+            with open(final_path, "wb") as f:
+                f.write(content)
             
-            # Update database with new path using fid update
-            from fid import update_single
-            update_single(fid, temp_path, final_path)
+            # Register in fid database
+            register_single(final_path)
             
             self.send_success_response({
-                "fid": fid,
+                "fid": provided_fid,
                 "status": "uploaded"
             })
+            
         except Exception as e:
-            # Clean up temp file if move failed
+            # Clean up on failure
+            import traceback
+            traceback.print_exc()
             try:
-                os.remove(temp_path)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                if os.path.isdir(fid_dir) and not os.listdir(fid_dir):
+                    os.rmdir(fid_dir)
             except:
                 pass
-            self.send_error_response(500, f"cannot finalize upload: {e}")
+            self.send_error_response(500, f"cannot save file: {e}")
     
     def handle_list(self):
         """Handle /list request."""

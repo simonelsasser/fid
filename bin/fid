@@ -1911,11 +1911,24 @@ def main():
         if subcmd == "init":
             # Run fid_git.py init
             import subprocess
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            fid_git_path = os.path.join(script_dir, "fid_git.py")
             
-            if not os.path.exists(fid_git_path):
+            # Search for fid_git.py in multiple locations
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            possible_paths = [
+                os.path.join(script_dir, "fid_git.py"),
+                "/usr/local/bin/fid_git.py",
+                "/Users/simonelsasser/GitHub/fid/bin/fid_git.py",
+            ]
+            
+            fid_git_path = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    fid_git_path = path
+                    break
+            
+            if not fid_git_path:
                 print("error: fid_git.py not found", file=sys.stderr)
+                print("Please run: sudo cp /Users/simonelsasser/GitHub/fid/bin/fid_git.py /usr/local/bin/", file=sys.stderr)
                 sys.exit(1)
             
             result = subprocess.run([sys.executable, fid_git_path, "init"])
