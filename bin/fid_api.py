@@ -423,6 +423,9 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         filename_list = params.get("filename", [])
         filename = filename_list[0] if filename_list else None
         
+        # Debug logging
+        print(f"fid-api: upload received - fid={provided_fid}, filename={filename}", file=sys.stderr)
+        
         content_length = int(self.headers.get("Content-Length", 0))
         
         if content_length == 0:
@@ -464,40 +467,26 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 })
                 return
         
-        # Check if fid exists in database (another form of duplicate)
+        # Note: We don't check database for duplicates here
+        # Database may have local paths, but we want to save to uploads directory
+        # Only check if file already exists in uploads directory (above)
         conn = db()
         cur = conn.cursor()
         
-        existing = cur.execute(
-            "SELECT md5_base62 FROM files WHERE md5_hex=?",
-            (md5_hex,)
-        ).fetchone()
-        
-        if existing:
-            # Fid exists in database - check if any valid path exists
-            paths = cur.execute(
-                "SELECT path FROM locations WHERE md5_hex=?",
-                (md5_hex,)
-            ).fetchall()
-            
-            for (path,) in paths:
-                pfx, val = split_path(path)
-                if pfx == "local" and os.path.exists(val):
-                    try:
-                        if os.path.getsize(val) == len(content):
-                            # File already exists
-                            self.send_success_response({
-                                "fid": provided_fid,
-                                "status": "existing",
-                                "message": "file already exists on server"
-                            })
-                            return
-                    except:
-                        pass
-        
         # Not a duplicate - save file in <fid>/<filename> structure
         try:
-            os.makedirs(fid_dir, exist_ok=True)
+            # Handle migration: old files saved as just <fid> (file)
+            # Need to convert to new <fid>/<filename> (directory) structure
+            if os.path.exists(fid_dir) and os.path.isfile(fid_dir):
+                # Old format: fid_dir is a file, need to convert to directory
+                temp_path = fid_dir + ".tmp"
+                os.rename(fid_dir, temp_path)  # Rename to avoid conflict
+                os.makedirs(fid_dir)
+                # Move content into directory with fid as filename (no original filename known)
+                old_format_path = os.path.join(fid_dir, provided_fid)
+                os.rename(temp_path, old_format_path)
+            elif not os.path.exists(fid_dir):
+                os.makedirs(fid_dir)
             
             # Use provided filename or fallback to fid
             final_filename = filename if filename else provided_fid

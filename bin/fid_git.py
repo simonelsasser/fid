@@ -127,7 +127,11 @@ def upload_to_server(content, filename, fid, config, auth_key):
     server_url = server_url.rstrip("/")
     
     # Upload to server with fid and filename as query parameters
-    upload_url = f"{server_url}/upload?fid={fid}&filename={urllib.parse.quote(filename or '')}"
+    # Only include filename if actually provided
+    if filename:
+        upload_url = f"{server_url}/upload?fid={fid}&filename={urllib.parse.quote(filename)}"
+    else:
+        upload_url = f"{server_url}/upload?fid={fid}"
     
     try:
         req = urllib.request.Request(
@@ -344,11 +348,41 @@ def clean_filter(filename):
     
     auth_key = get_auth_key(config, repo_root)
     
+    # Git doesn't pass filename to clean filter via command line
+    # We need to detect it from git status or use the provided argument
+    if not filename:
+        # Try to get filename from git status (files being added/modified)
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            print(f"fid-git: git status output: {result.stdout[:200]}", file=sys.stderr)
+            # Get files being added (A) or modified (M)
+            for line in result.stdout.splitlines():
+                if line.startswith(("A ", "M ", "AM ", "??")):
+                    # Extract filename (skip status codes)
+                    candidate = line[3:].strip()
+                    candidate_path = os.path.join(repo_root, candidate)
+                    if os.path.isfile(candidate_path):
+                        filename = candidate
+                        print(f"fid-git: detected filename={filename}", file=sys.stderr)
+                        break
+        except Exception as e:
+            print(f"fid-git: error detecting filename: {e}", file=sys.stderr)
+    
     # Get absolute path of file being added
     if filename and not os.path.isabs(filename):
         filepath = os.path.join(repo_root, filename)
     else:
         filepath = filename
+    
+    # Debug: log filename detected
+    print(f"fid-git: clean filter using filename={filename}", file=sys.stderr)
     
     # Step 1: Get fid for file (from DB or register)
     fid = get_fid_for_file(filepath) if filepath else None
