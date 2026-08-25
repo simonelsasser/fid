@@ -141,7 +141,7 @@ def upload_to_server(content, filename, fid, config, auth_key):
         if auth_key:
             req.add_header("Authorization", f"Bearer {auth_key}")
         
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:  # 10 minute timeout for large files
             result = json.loads(resp.read().decode())
             
             if result.get("status") in ("uploaded", "existing"):
@@ -153,6 +153,10 @@ def upload_to_server(content, filename, fid, config, auth_key):
     except urllib.error.HTTPError as e:
         error_body = e.read().decode() if e.fp else ""
         print(f"fid-git: upload failed (HTTP {e.code}): {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"fid-git: upload failed (connection error): {e.reason}", file=sys.stderr)
+        print(f"fid-git: HINT: Check that server is running and reachable", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"fid-git: upload failed: {e}", file=sys.stderr)
