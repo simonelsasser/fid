@@ -370,19 +370,15 @@ def clean_filter(filename):
                     candidate_path = os.path.join(repo_root, candidate)
                     if os.path.isfile(candidate_path):
                         filename = candidate
-                        print(f"fid-git: detected filename={filename}", file=sys.stderr)
                         break
-        except Exception as e:
-            print(f"fid-git: error detecting filename: {e}", file=sys.stderr)
+        except Exception:
+            pass
     
     # Get absolute path of file being added
     if filename and not os.path.isabs(filename):
         filepath = os.path.join(repo_root, filename)
     else:
         filepath = filename
-    
-    # Debug: log filename detected
-    print(f"fid-git: clean filter using filename={filename}", file=sys.stderr)
     
     # Step 1: Get fid for file (from DB or register)
     fid = get_fid_for_file(filepath) if filepath else None

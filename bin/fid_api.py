@@ -364,32 +364,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 self.send_success_response({"fid": md5_b62, "url": download_url})
                 return
         
-        # Check server uploads directory (<fid>/<filename> structure)
-        fid_dir = os.path.join(self.config.upload_dir, md5_b62)
-        if os.path.isdir(fid_dir):
-            # Get first file in directory (should be only one)
-            files = os.listdir(fid_dir)
-            if files:
-                upload_path = os.path.join(fid_dir, files[0])
-                # Verify file size matches stored size
-                try:
-                    stored_size = cur.execute(
-                        "SELECT size FROM files WHERE md5_hex=?",
-                        (md5_hex,)
-                    ).fetchone()
-                    if stored_size and stored_size[0] is not None:
-                        current_size = os.path.getsize(upload_path)
-                        if current_size != stored_size[0]:
-                            print(f"fid-api: size mismatch for {upload_path}", file=sys.stderr)
-                            self.send_error_response(500, "file corrupted")
-                            return
-                except Exception as e:
-                    print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
-                
-                # File exists, return download URL
-                self.send_success_response({"fid": md5_b62, "url": download_url})
-                return
-        
+        # Fid not found or no valid paths
         self.send_error_response(404, "fid not found")
     
     def handle_upload(self):
@@ -423,9 +398,6 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         filename_list = params.get("filename", [])
         filename = filename_list[0] if filename_list else None
         
-        # Debug logging
-        print(f"fid-api: upload received - fid={provided_fid}, filename={filename}", file=sys.stderr)
-        
         content_length = int(self.headers.get("Content-Length", 0))
         
         if content_length == 0:
@@ -453,40 +425,41 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(400, "FID_MISMATCH")
             return
         
-        # Check if fid already exists on server (duplicate detection)
-        fid_dir = os.path.join(self.config.upload_dir, provided_fid)
-        
-        if os.path.isdir(fid_dir):
-            # File already exists on server
-            files = os.listdir(fid_dir)
-            if files:
-                self.send_success_response({
-                    "fid": provided_fid,
-                    "status": "existing",
-                    "message": "file already exists on server"
-                })
-                return
-        
-        # Note: We don't check database for duplicates here
-        # Database may have local paths, but we want to save to uploads directory
-        # Only check if file already exists in uploads directory (above)
+        # Check if fid already exists in uploads directory (universal check using database + size)
+        # This is the same check used by "fid resolve <fid> --check-size"
+        # But we only check server upload paths, not local paths
         conn = db()
         cur = conn.cursor()
         
-        # Not a duplicate - save file in <fid>/<filename> structure
+        # Get stored size for this fid
+        stored = cur.execute(
+            "SELECT size FROM files WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchone()
+        
+        if stored and stored[0] is not None and stored[0] == len(content):
+            # Size matches - check if any server upload path exists
+            upload_paths = cur.execute(
+                "SELECT path FROM locations WHERE md5_hex=?",
+                (md5_hex,)
+            ).fetchall()
+            
+            for (path,) in upload_paths:
+                pfx, val = split_path(path)
+                # Check if path is under server uploads directory
+                if val.startswith(self.config.upload_dir) and os.path.exists(val):
+                    # File exists in server uploads with matching size
+                    self.send_success_response({
+                        "fid": provided_fid,
+                        "status": "existing",
+                        "message": "file already exists on server"
+                    })
+                    return
+        
+        # Save file to uploads directory in <fid>/<filename> structure
         try:
-            # Handle migration: old files saved as just <fid> (file)
-            # Need to convert to new <fid>/<filename> (directory) structure
-            if os.path.exists(fid_dir) and os.path.isfile(fid_dir):
-                # Old format: fid_dir is a file, need to convert to directory
-                temp_path = fid_dir + ".tmp"
-                os.rename(fid_dir, temp_path)  # Rename to avoid conflict
-                os.makedirs(fid_dir)
-                # Move content into directory with fid as filename (no original filename known)
-                old_format_path = os.path.join(fid_dir, provided_fid)
-                os.rename(temp_path, old_format_path)
-            elif not os.path.exists(fid_dir):
-                os.makedirs(fid_dir)
+            fid_dir = os.path.join(self.config.upload_dir, provided_fid)
+            os.makedirs(fid_dir, exist_ok=True)
             
             # Use provided filename or fallback to fid
             final_filename = filename if filename else provided_fid
