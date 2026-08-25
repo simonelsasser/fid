@@ -444,12 +444,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         fid_dir = os.path.join(self.config.upload_dir, provided_fid)
         
         if os.path.isdir(fid_dir):
-            # Duplicate - file already exists
+            # File already exists on server
             files = os.listdir(fid_dir)
             if files:
                 self.send_success_response({
                     "fid": provided_fid,
-                    "status": "duplicate",
+                    "status": "existing",
                     "message": "file already exists on server"
                 })
                 return
@@ -475,10 +475,10 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 if pfx == "local" and os.path.exists(val):
                     try:
                         if os.path.getsize(val) == len(content):
-                            # Valid duplicate found
+                            # File already exists
                             self.send_success_response({
                                 "fid": provided_fid,
-                                "status": "duplicate",
+                                "status": "existing",
                                 "message": "file already exists on server"
                             })
                             return

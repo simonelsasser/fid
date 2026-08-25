@@ -144,9 +144,7 @@ def upload_to_server(content, filename, fid, config, auth_key):
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read().decode())
             
-            if result.get("status") == "uploaded":
-                return result.get("fid")
-            elif result.get("status") == "duplicate":
+            if result.get("status") in ("uploaded", "existing"):
                 return result.get("fid")
             else:
                 print(f"fid-git: upload failed: {result}", file=sys.stderr)
