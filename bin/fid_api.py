@@ -311,6 +311,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
     def handle_resolve(self, params):
         """Handle /resolve?fid=<fid> request.
         
+        Uses fid.resolve_single() for path resolution with self-healing.
         Returns download URL instead of internal path for security.
         """
         fid_list = params.get("fid", [])
@@ -321,51 +322,31 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         
         fid_prefix = fid_list[0]
         
-        # Look up fid in database
-        conn = db()
-        matches = lookup(conn, fid_prefix)
+        # Use fid.resolve_single() which handles:
+        # - Prefix lookup
+        # - Path existence checking
+        # - Self-healing (removes stale paths)
+        # - Size validation (if check_size=True)
+        from fid import resolve_single
         
-        if len(matches) != 1:
+        # Resolve with size check to trigger self-healing
+        resolved_path = resolve_single(fid_prefix, check_size=True)
+        
+        if resolved_path is None:
+            # resolve_single() already printed error and cleaned up stale paths
             self.send_error_response(404, "fid not found")
             return
         
+        # Get the full fid (resolve_single validates it exists)
+        conn = db()
+        matches = lookup(conn, fid_prefix)
         md5_hex, md5_b62 = matches[0]
         
         # Construct download URL (never expose internal paths)
-        # Get server URL from request
         host = self.headers.get("Host", "localhost")
         download_url = f"http://{host}/?fid={md5_b62}"
         
-        # Find local path (just to verify file exists)
-        cur = conn.cursor()
-        rows = cur.execute(
-            "SELECT path FROM locations WHERE md5_hex=?",
-            (md5_hex,)
-        ).fetchall()
-        
-        for (path,) in rows:
-            pfx, val = split_path(path)
-            if pfx == "local" and os.path.exists(val):
-                # Verify file size matches stored size
-                try:
-                    stored_size = cur.execute(
-                        "SELECT size FROM files WHERE md5_hex=?",
-                        (md5_hex,)
-                    ).fetchone()
-                    if stored_size and stored_size[0] is not None:
-                        current_size = os.path.getsize(val)
-                        if current_size != stored_size[0]:
-                            print(f"fid-api: size mismatch for {val}", file=sys.stderr)
-                            continue  # Try next path
-                except Exception as e:
-                    print(f"fid-api: cannot verify size: {e}", file=sys.stderr)
-                
-                # File exists, return download URL
-                self.send_success_response({"fid": md5_b62, "url": download_url})
-                return
-        
-        # Fid not found or no valid paths
-        self.send_error_response(404, "fid not found")
+        self.send_success_response({"fid": md5_b62, "url": download_url})
     
     def handle_upload(self):
         """Handle /upload POST request with fid and filename from query parameters.
