@@ -348,31 +348,9 @@ def clean_filter(filename):
     
     auth_key = get_auth_key(config, repo_root)
     
-    # Git doesn't pass filename to clean filter via command line
-    # We need to detect it from git status or use the provided argument
-    if not filename:
-        # Try to get filename from git status (files being added/modified)
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            print(f"fid-git: git status output: {result.stdout[:200]}", file=sys.stderr)
-            # Get files being added (A) or modified (M)
-            for line in result.stdout.splitlines():
-                if line.startswith(("A ", "M ", "AM ", "??")):
-                    # Extract filename (skip status codes)
-                    candidate = line[3:].strip()
-                    candidate_path = os.path.join(repo_root, candidate)
-                    if os.path.isfile(candidate_path):
-                        filename = candidate
-                        break
-        except Exception:
-            pass
+    # Git may pass filename as command-line argument
+    # Use it if provided, otherwise skip filename (upload without it)
+    # IMPORTANT: Do NOT use git status here - it triggers clean filter recursively!
     
     # Get absolute path of file being added
     if filename and not os.path.isabs(filename):
