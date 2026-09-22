@@ -345,6 +345,21 @@ Automatically downloads remote copy if needed.
 
 Verifies checksum before returning.
 
+An ad hoc remote server can be supplied with an `@server` suffix:
+
+```bash
+fid resolve fid://ABC123@data.example.org
+```
+
+Resolution order is:
+
+1. A valid local location already registered for the fid.
+2. `http://data.example.org/api/download?fid=ABC123`.
+3. Remote locations stored for the fid, then API servers in the `remotes` table.
+
+The ad hoc server is not added to the `remotes` table. A successful download is
+registered as a normal remote location for that fid.
+
 ---
 
 ## Verify local copies

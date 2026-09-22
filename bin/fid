@@ -26,7 +26,7 @@ KEEP_CACHE = True
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 ########################################
 
@@ -427,7 +427,7 @@ def register(paths, no_duplicate=False):
 ############ RESOLVE ###################
 
 
-def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, check_size=False):
+def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, check_size=False, server=None):
     """Resolve a single fid prefix to a path. Returns path on success, None on error.
     
     If domain is provided, only return paths containing the domain string.
@@ -436,6 +436,7 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
     If allow_remote is True, return remote URLs as-is without downloading
     or validating them.
     If check_size is True, verify file size matches stored size.
+    If server is provided, try it after local paths and before registered remotes.
     """
     conn = db()
 
@@ -446,6 +447,14 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
     matches = lookup(conn, prefix)
 
     if len(matches) == 0:
+
+        if server and len(prefix) == 22:
+
+            result = resolve_from_server(prefix, server, domain, allow_remote, check_size)
+
+            if result:
+
+                return result
 
         if try_remote and len(prefix) == 22:
 
@@ -527,6 +536,14 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
 
     conn.commit()
 
+    if server:
+
+        result = resolve_from_server(prefix, server, domain, allow_remote, check_size)
+
+        if result:
+
+            return result
+
     for loc_id, pfx, val in remote:
 
         remote_url = f"{pfx}://{val}"
@@ -552,6 +569,8 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
             )
 
             continue
+
+        downloaded_size = os.path.getsize(tmp)
         
         # Prefer registered name/extension; fall back to URL-derived basename
         row = cur.execute(
@@ -573,6 +592,11 @@ def resolve_single(prefix, domain=None, try_remote=True, allow_remote=False, che
         conn.execute(
             "INSERT INTO locations VALUES(NULL,?,?,?)",
             (md5_hex, cache_path, datetime.now())
+        )
+
+        conn.execute(
+            "UPDATE files SET size=? WHERE md5_hex=?",
+            (downloaded_size, md5_hex)
         )
 
         conn.commit()
@@ -748,7 +772,23 @@ def resolve(prefixes, domain=None, allow_remote=False, check_size=False):
     """Resolve one or more fid prefixes to paths. Returns 0 on success, 1 on error."""
     has_error = False
     for prefix in prefixes:
-        path = resolve_single(prefix.replace("fid://", ""), domain=domain, allow_remote=allow_remote, check_size=check_size)
+        prefix = prefix.replace("fid://", "")
+        fid_prefix, separator, server = prefix.partition("@")
+        if separator and not server:
+            print("ERROR:INVALID_SERVER", file=sys.stderr)
+            has_error = True
+            continue
+        if server and len(fid_prefix) != 22:
+            print("ERROR:INVALID_FID", file=sys.stderr)
+            has_error = True
+            continue
+        path = resolve_single(
+            fid_prefix,
+            domain=domain,
+            allow_remote=allow_remote,
+            check_size=check_size,
+            server=server or None,
+        )
         if path:
             print(path)
         else:
@@ -1380,7 +1420,7 @@ def read(input_file=None):
         # Insert into database directly (upsert on md5_hex)
         try:
             cur.execute(
-                "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
+                "INSERT OR IGNORE INTO files(md5_hex, md5_base62, created, name, extension) VALUES (?,?,?,?,?)",
                 (md5_hex, md5_b62, datetime.now(), name, extension)
             )
             
@@ -1508,6 +1548,31 @@ def remote_head_ok(url):
         return False
 
 
+def resolve_from_server(fid_b62, server, domain=None, allow_remote=False, check_size=False):
+    """Resolve a fid from an ad hoc server before trying registered remotes."""
+    base_url = server.rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+
+    download_url = f"{base_url}/api/download?fid={fid_b62}"
+    if not remote_head_ok(download_url):
+        return None
+
+    if allow_remote:
+        return download_url
+
+    if not register_remote_host_location(download_url, fid_b62):
+        return None
+
+    return resolve_single(
+        fid_b62,
+        domain=domain,
+        try_remote=False,
+        allow_remote=allow_remote,
+        check_size=check_size,
+    )
+
+
 def add_remote_host_location(url, fid_b62):
     """Add a remote host URL as a location for an existing fid."""
     conn = db()
@@ -1562,7 +1627,7 @@ def register_remote_host_location(url, fid_b62):
 
     # Insert file record
     cur.execute(
-        "INSERT OR IGNORE INTO files VALUES (?,?,?,?,?)",
+        "INSERT OR IGNORE INTO files(md5_hex, md5_base62, created, name, extension) VALUES (?,?,?,?,?)",
         (md5_hex, fid_b62, datetime.now(), name, extension)
     )
 
@@ -1598,6 +1663,7 @@ COMMANDS:
 
     resolve [--domain STRING] [--allow-remote] [--check-size] <fid> [<fid> ...]
         Resolve fid(s) to file path(s)
+        A fid may use @server to try its /api/download endpoint before registered remotes
         --domain STRING    Only return paths containing STRING
         --allow-remote     Return remote URLs without downloading
         --check-size       Warn if file size doesn't match stored size
@@ -1678,6 +1744,7 @@ COMMANDS:
 EXAMPLES:
     fid register /path/to/file.txt
     fid resolve ABC123...XYZ
+    fid resolve fid://ABC123...XYZ@data.example.org
     fid verify --bysize ABC123...XYZ
     fid id --register /path/to/file.txt
     fid list --project myproject

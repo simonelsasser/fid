@@ -131,7 +131,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
         
-        if path == "/download":
+        if path in ("/download", "/api/download"):
             self.handle_download(params)
         elif path == "/resolve":
             self.handle_resolve(params)
@@ -154,8 +154,8 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
         
-        # Support both /?fid=XXX and /download?fid=XXX
-        if path == "/" or path == "/download":
+        # Support root and both download endpoint forms.
+        if path in ("/", "/download", "/api/download"):
             if "fid" in params:
                 self.handle_head_download(params)
                 return
