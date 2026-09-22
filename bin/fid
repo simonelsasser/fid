@@ -845,7 +845,16 @@ def verify_single(prefix, bysize=False):
 
     md5_hex = matches[0][0]
     
-    reference_size = None
+    stored_size = None
+    if bysize:
+        size_row = conn.execute(
+            "SELECT size FROM files WHERE md5_hex=?",
+            (md5_hex,)
+        ).fetchone()
+        if not size_row or size_row[0] is None:
+            print("stored size unavailable", file=sys.stderr)
+            return
+        stored_size = size_row[0]
 
     for loc_id, path in conn.execute(
         "SELECT id,path FROM locations WHERE md5_hex=?",
@@ -868,12 +877,8 @@ def verify_single(prefix, bysize=False):
             # Verify by file size
             try:
                 file_size = os.path.getsize(val)
-                
-                # Use first file's size as reference
-                if reference_size is None:
-                    reference_size = file_size
-                
-                if file_size == reference_size:
+
+                if file_size == stored_size:
                     print("OK", val)
                 else:
                     print("MISMATCH", val)
