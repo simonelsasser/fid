@@ -2,7 +2,7 @@
 """
 Fid Server - HTTP API server for fid file management
 
-Provides REST API endpoints for downloading, uploading, and listing fids.
+Provides download, resolve and verify endpoints; uploads and listing are opt-in.
 """
 
 import os
@@ -41,7 +41,7 @@ DEFAULT_UPLOAD_DIR = os.path.join(FID_HOME, "server_uploads")
 class FidServerConfig:
     """Server configuration."""
     
-    def __init__(self, port, upload_dir, auth_key=None, allow_upload=True):
+    def __init__(self, port, upload_dir, auth_key=None, allow_upload=False):
         self.port = port
         self.upload_dir = upload_dir
         self.auth_key = auth_key
@@ -135,7 +135,9 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.handle_download(params)
         elif path == "/resolve":
             self.handle_resolve(params)
-        elif path == "/list":
+        elif path == "/verify":
+            self.handle_resolve(params, verify=True)
+        elif path == "/list" and self.config.allow_upload:
             self.handle_list()
         elif path == "/" and "fid" in params:
             # Backward compatibility: support ?fid=XXX at root for fid remote
@@ -174,7 +176,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         
         if path == "/upload":
             if not self.config.allow_upload:
-                self.send_error_response(403, "upload not permitted")
+                self.send_error_response(404, "not found")
                 return
             self.handle_upload()
         else:
@@ -308,11 +310,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
     
-    def handle_resolve(self, params):
-        """Handle /resolve?fid=<fid> request.
+    def handle_resolve(self, params, verify=False):
+        """Handle /resolve or /verify?fid=<fid> requests.
         
         Uses fid.resolve_single() for path resolution with self-healing.
         Returns download URL instead of internal path for security.
+        Verification recalculates the content hash, without changing the fid.
         """
         fid_list = params.get("fid", [])
         
@@ -329,8 +332,8 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         # - Size validation (if check_size=True)
         from fid import resolve_single
         
-        # Resolve with size check to trigger self-healing
-        resolved_path = resolve_single(fid_prefix, check_size=True)
+        # Verify hashes even size-mismatched files to report a content mismatch.
+        resolved_path = resolve_single(fid_prefix, check_size=not verify)
         
         if resolved_path is None:
             # resolve_single() already printed error and cleaned up stale paths
@@ -341,6 +344,16 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         conn = db()
         matches = lookup(conn, fid_prefix)
         md5_hex, md5_b62 = matches[0]
+
+        if verify:
+            try:
+                actual_fid = base62_encode(md5_file(resolved_path))
+            except OSError:
+                self.send_error_response(500, "cannot read file for verification")
+                return
+            if actual_fid != md5_b62:
+                self.send_error_response(409, "FID_MISMATCH")
+                return
         
         # Construct download URL (never expose internal paths)
         host = self.headers.get("Host", "localhost")
@@ -539,7 +552,7 @@ def main():
 Examples:
   fid-server --port 8080
   fid-server --port 8080 --auth-key mysecret
-  fid-server --port 8080 --no-upload
+  fid-server --port 8080 --enable-upload
   fid-server --port 8080 --upload-dir /path/to/uploads
         """
     )
@@ -566,9 +579,9 @@ Examples:
     )
     
     parser.add_argument(
-        "--no-upload",
+        "--enable-upload",
         action="store_true",
-        help="Disable upload endpoint"
+        help="Enable upload and list endpoints (disabled by default)"
     )
     
     args = parser.parse_args()
@@ -577,7 +590,7 @@ Examples:
         port=args.port,
         upload_dir=args.upload_dir,
         auth_key=args.auth_key,
-        allow_upload=not args.no_upload
+        allow_upload=args.enable_upload
     )
     
     server = FidServer(config)

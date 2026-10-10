@@ -631,11 +631,25 @@ First, ensure you have a fid server running:
 
 ```bash
 # On server machine (e.g., SimonEiMac.scilifelab.se)
-fid_api.py --port 8080
+fid_api.py --port 8080 --enable-upload
 
 # Or as a LaunchDaemon (macOS)
 sudo launchctl load /Library/LaunchDaemons/com.fid.server.plist
 ```
+
+The standalone API provides download, resolve and verify by default. Git filter
+uploads require `--enable-upload` (also add it to the LaunchDaemon arguments).
+This flag enables `/upload` and `/list`; it replaces the old `--no-upload` flag.
+The API's `/resolve` checks local file size against the stored size when known,
+but does not rehash local content. CLI `fid resolve` requires `--check-size`
+to perform that size check.
+
+`GET /verify?fid=ID` resolves a full fid or unique prefix and recalculates the
+file's MD5-based fid. A match returns the same `{fid, url}` JSON as `/resolve`;
+a mismatch returns HTTP 409 with `{"error": "FID_MISMATCH"}`. Missing files
+return 404; a missing fid parameter returns 400. It uses the same authentication
+as other endpoints and does not update the registered fid. Verification reads
+the whole file, detecting same-size changes that `/resolve` cannot detect.
 
 ## Client Setup - New Repository
 
