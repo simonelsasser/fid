@@ -651,6 +651,10 @@ return 404; a missing fid parameter returns 400. It uses the same authentication
 as other endpoints and does not update the registered fid. Verification reads
 the whole file, detecting same-size changes that `/resolve` cannot detect.
 
+Downloads stream in 1 MiB chunks with a `Content-Length` header, rather than
+loading the whole file into memory. The server still handles requests serially;
+uploads, when enabled, are still buffered in memory.
+
 ## Client Setup - New Repository
 
 ### Step 1: Install fid

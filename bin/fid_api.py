@@ -89,19 +89,27 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             self.send_error_response(404, "file not found")
             return
         
+        headers_sent = False
         try:
             with open(filepath, "rb") as f:
-                content = f.read()
-            
-            basename = os.path.basename(filepath)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{basename}"')
-            self.send_header("Content-Length", len(content))
-            self.end_headers()
-            self.wfile.write(content)
+                size = os.fstat(f.fileno()).st_size
+                basename = os.path.basename(filepath)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{basename}"')
+                self.send_header("Content-Length", size)
+                self.end_headers()
+                headers_sent = True
+                shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            # A disconnected download client needs no further response.
+            return
         except Exception as e:
-            self.send_error_response(500, f"cannot read file: {e}")
+            if headers_sent:
+                self.close_connection = True
+                print(f"fid-api: download failed: {e}", file=sys.stderr)
+            else:
+                self.send_error_response(500, f"cannot read file: {e}")
     
     def check_auth(self):
         """Check authentication if configured."""

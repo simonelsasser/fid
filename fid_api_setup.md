@@ -20,8 +20,10 @@ runs `Datadrop API.app/Contents/MacOS/DatadropAPI`, with `RunAtLoad`,
 `KeepAlive` and a 30-second restart throttle. As a user agent it depends on
 that user's login, unlike the system daemon described below.
 
-Verified locally: `/api/resolve?token=TOKEN&fid=ID` returns HTTP 200 and plain
-text `/api/download?fid=ID`; HEAD on that download returns 200. Tokens are
+Verified locally: `/api/resolve?token=TOKEN&fid=ID` returns HTTP 200 and JSON
+`{fid, url}` with an absolute `/api/download?fid=ID` URL; HEAD returns 200. Datadrop resolve
+now checks recorded size when available, and `/api/verify` hashes the file,
+returning the same JSON on success or 409 on a fid mismatch. Tokens are
 loaded from Datadrop's `config/api_tokens.yaml`. The public gateway additionally
 requires **OpenCloud Basic authentication**: a token alone currently returns
 401 with `WWW-Authenticate: Basic`. To test publicly, use
@@ -214,8 +216,9 @@ POST `/api/upload` return 404 by default. If `--enable-upload` is set, test:
 curl -f -H "Authorization: Bearer $KEY" --data-binary @"$FILE" "$BASE/upload?fid=$FID&filename=test.txt"
 ```
 
-Expect upload JSON with `uploaded` or `existing`. Requests are handled serially
-and transfers held in RAM; use a small file. `/resolve` checks existence and
+Expect upload JSON with `uploaded` or `existing`. Downloads stream in 1 MiB
+chunks; uploads are held in RAM and requests handled serially. `/resolve` checks
+existence and
 stored size when known, not MD5; same-size edits are not detected.
 `/verify?fid=ID` recalculates the MD5-based fid and returns the same JSON on a
 match, or HTTP 409 (`FID_MISMATCH`) on changed content. It reads the whole file
