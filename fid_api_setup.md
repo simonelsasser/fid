@@ -1,46 +1,11 @@
 # Standalone fid API setup — macOS Monterey (12) and later
 
 Use Apple's Apache and a system LaunchDaemon. Required: Python 3.9+, git,
-administrator access, a hostname resolving to this Mac, and a TLS certificate
+administrator access, a hostname resolving to the server, and a TLS certificate
 valid for that hostname. No Python packages are required.
 
-## Existing working fid API on this Mac (audited 2026-10-10)
-
-The live fid endpoints are provided by **Datadrop API**, not this repository's
-`fid_api.py`. The request path is:
-
-`https://data.elsasser-server.sc.privat/api/...` → Apple's Apache TLS vhost
-(`/etc/apache2/extra/data-https.conf`) → Docker `data-auth-gateway` on
-`127.0.0.1:8002` → Datadrop API on host port **8001**, preserving `/api`.
-
-Datadrop lives in `/Library/Application Support/LocalServers/datadrop-server`.
-Its `api_server.py` uses FastAPI/uvicorn and the installed fid CLI. A user
-LaunchAgent, `~/Library/LaunchAgents/com.simonelsasser.datadrop-api.plist`,
-runs `Datadrop API.app/Contents/MacOS/DatadropAPI`, with `RunAtLoad`,
-`KeepAlive` and a 30-second restart throttle. As a user agent it depends on
-that user's login, unlike the system daemon described below.
-
-Verified locally: `/api/resolve?token=TOKEN&fid=ID` returns HTTP 200 and JSON
-`{fid, url}` with an absolute `/api/download?fid=ID` URL; HEAD returns 200. Datadrop resolve
-now checks recorded size when available, and `/api/verify` hashes the file,
-returning the same JSON on success or 409 on a fid mismatch. Tokens are
-loaded from Datadrop's `config/api_tokens.yaml`. The public gateway additionally
-requires **OpenCloud Basic authentication**: a token alone currently returns
-401 with `WWW-Authenticate: Basic`. To test publicly, use
-`curl -u USER 'https://HOST/api/resolve?token=TOKEN&fid=ID'`
-(curl prompts for the password). The token authenticates the backend, while
-Basic auth authenticates the gateway.
-
-**Important differences:** Datadrop preserves `/api`, has no upload endpoint
-in the inspected API source, and `/api/list` requires a project. A fid remote
-must target `/api/download`, not `/api/`. The fid CLI does not implement this
-gateway's Basic-auth login. Reproducing the existing deployment requires
-Datadrop plus its gateway/OpenCloud stack, not just the steps below.
-
-The following recipe deploys the **standalone** `fid_api.py` on a separate
-hostname. It strips `/api` and uses token-only authentication. On this Mac,
-Python `/usr/bin/python3` is 3.9.6, installed fid scripts are older than this
-checkout, and no standalone `com.fid.server` or port-8080 listener exists.
+This recipe deploys `fid_api.py` behind a reverse proxy mounted at `/api`.
+The proxy strips `/api`; the backend uses token authentication.
 
 Replace `example.domain.com`, `YOUR_USER`, `PYTHON_PATH`, certificate paths,
 and `REPLACE_WITH_SECRET` before applying examples. Keep the same secret on
@@ -102,7 +67,7 @@ uploads then default to the data directory's `server_uploads/`. The old
 The API binds **all IPv4 interfaces**, with no `--host` option. Restrict inbound
 TCP 8080 using the site's persistent host/network firewall while allowing local
 Apache access; verify that other computers cannot reach port 8080 directly.
-The auth key is still required. This Mac currently has no fid-specific pf rules.
+The auth key is still required.
 
 ## 3. Reverse proxy (required)
 
