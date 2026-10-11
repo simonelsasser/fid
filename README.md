@@ -642,20 +642,23 @@ uploads require `--enable-upload` (also add it to the LaunchDaemon arguments).
 This flag enables `/upload` and `/list`; it replaces the old `--no-upload` flag.
 The API's `/resolve` checks local file size against the stored size when known,
 but does not rehash local content. CLI `fid resolve` requires `--check-size`
-to perform that size check.
+to perform that size check. On success it returns the filename of the resolved
+file as plain text (`text/plain`); on failure the body is empty.
 
 `GET /verify?fid=ID` resolves a full fid or unique prefix and recalculates the
-file's MD5-based fid. A match returns the same `{fid, url}` JSON as `/resolve`;
-a mismatch returns HTTP 409 with `{"error": "FID_MISMATCH"}`. Missing files
-return 404; a missing fid parameter returns 400. It uses the same authentication
-as other endpoints and does not update the registered fid. Verification reads
-the whole file, detecting same-size changes that `/resolve` cannot detect.
+file's MD5-based fid. A match returns the filename (same `text/plain` body as
+`/resolve`); a mismatch returns HTTP 409 with `{"error": "FID_MISMATCH"}`.
+Missing files return 404 with an empty body; a missing fid parameter returns
+400. It uses the same authentication as other endpoints and does not update
+the registered fid. Verification reads the whole file, detecting same-size
+changes that `/resolve` cannot detect.
 
-Both `/resolve` and `/verify` return a download URL built from the client's own
-request: the scheme honors `X-Forwarded-Proto` (so it is `https` behind a TLS
-reverse proxy), the host honors `X-Forwarded-Host` or `Host`, and the
-`/resolve` (or `/verify`) segment is swapped to `/download` (keeping any proxy
-prefix such as `/api`).
+Both `/resolve` and `/verify` return the plain **filename** of the file on the
+server as `text/plain` — never an internal path and never a URL (a client that
+can reach these endpoints already knows how to reach `/download`, and a
+filename cannot carry authentication). Use them to check whether a fid exists
+on the server and what its filename is, for example to compare with a local
+copy. `GET /download?fid=ID` remains the endpoint for fetching content.
 
 API responses never reveal internal file paths. Downloads identify the file
 only by its basename in the `Content-Disposition` header, and error responses

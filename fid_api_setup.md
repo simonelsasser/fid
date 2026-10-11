@@ -78,7 +78,6 @@ once, and `Listen 443` exists once:
 LoadModule proxy_module libexec/apache2/mod_proxy.so
 LoadModule proxy_http_module libexec/apache2/mod_proxy_http.so
 LoadModule ssl_module libexec/apache2/mod_ssl.so
-LoadModule headers_module libexec/apache2/mod_headers.so
 ```
 
 For a new hostname, create `/etc/apache2/extra/fid-https.conf`:
@@ -91,19 +90,11 @@ For a new hostname, create `/etc/apache2/extra/fid-https.conf`:
     SSLCertificateKeyFile /path/to/privkey.pem
     ProxyRequests Off
     ProxyPassInherit Off
-    ProxyPreserveHost On
-    RequestHeader set X-Forwarded-Proto "https"
     LimitRequestBody 0
     ProxyPass        /api/ http://127.0.0.1:8080/ timeout=300
     ProxyPassReverse /api/ http://127.0.0.1:8080/
 </VirtualHost>
 ```
-
-`RequestHeader set X-Forwarded-Proto "https"` lets the backend rebuild the
-external URL (scheme/host/proxy prefix) that the client used, so `/resolve`
-and `/verify` return a working `https://…/api/download?fid=…` URL instead of a
-hard-coded HTTP one. `ProxyPreserveHost On` keeps the public hostname in the
-`Host` header.
 
 Add `Include /private/etc/apache2/extra/fid-https.conf` to `httpd.conf`.
 For an existing hostname, put these proxy/body directives inside its existing
@@ -181,9 +172,10 @@ curl -f -H "Authorization: Bearer $KEY" "$BASE/?fid=$FID" -o /tmp/fid-api-downlo
 cmp "$FILE" /tmp/fid-api-download.txt
 ```
 
-Expect resolve JSON, HEAD 200, and identical bytes. Without authentication,
-`/api/resolve?fid=ID` must return 401. With authentication, `/api/list` and
-POST `/api/upload` return 404 by default. If `--enable-upload` is set, test:
+Expect `text/plain` filename bodies, HEAD 200, and identical bytes. Without
+authentication, `/api/resolve?fid=ID` must return 401. With authentication,
+`/api/list` and POST `/api/upload` return 404 by default. If `--enable-upload`
+is set, test:
 
 ```bash
 curl -f -H "Authorization: Bearer $KEY" --data-binary @"$FILE" "$BASE/upload?fid=$FID&filename=test.txt"
@@ -191,11 +183,12 @@ curl -f -H "Authorization: Bearer $KEY" --data-binary @"$FILE" "$BASE/upload?fid
 
 Expect upload JSON with `uploaded` or `existing`. Downloads stream in 1 MiB
 chunks; uploads are held in RAM and requests handled serially. `/resolve` checks
-existence and
-stored size when known, not MD5; same-size edits are not detected.
-`/verify?fid=ID` recalculates the MD5-based fid and returns the same JSON on a
-match, or HTTP 409 (`FID_MISMATCH`) on changed content. It reads the whole file
-and does not change the registered fid. Both accept full IDs or unique prefixes.
+existence and stored size when known, not MD5; same-size edits are not detected.
+On success it returns the filename as plain text; on failure the body is empty.
+`/verify?fid=ID` recalculates the MD5-based fid and returns the same filename
+body on a match, or HTTP 409 (`FID_MISMATCH`) on changed content. It reads the
+whole file and does not change the registered fid. Both accept full IDs or
+unique prefixes.
 
 Use a publicly trusted certificate or a private CA trusted by **the selected
 Python interpreter**. For a private CA, `curl --cacert /path/to/ca.pem` tests it;
@@ -203,22 +196,18 @@ Python interpreter**. For a private CA, `curl --cacert /path/to/ca.pem` tests it
 The certificate must also match the hostname. Keychain trust alone may not
 suffice for every Python distribution.
 
-`/resolve` and `/verify` now return a working download URL built from the
-client's own request: same scheme (`https` via `X-Forwarded-Proto`), same
-host, and the `/resolve` (or `/verify`) part swapped to `/download`, so it
-keeps the proxy prefix. Verify it after deployment:
+Check the returned filename after deployment — it must match the basename of
+the uploaded/registered file, never a path or URL:
 
 ```bash
-RESOLVE_JSON=$(curl -f -H "Authorization: Bearer $KEY" "$BASE/resolve?fid=$FID")
-echo "$RESOLVE_JSON"                     # {"fid": "...", "url": "https://example.domain.com/api/download?fid=..."}
-DOWNLOAD_URL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<< "$RESOLVE_JSON")
-curl -f -H "Authorization: Bearer $KEY" "$DOWNLOAD_URL" -o /tmp/fid-api-url.txt
-cmp "$FILE" /tmp/fid-api-url.txt
+RESOLVED_NAME=$(curl -f -H "Authorization: Bearer $KEY" "$BASE/resolve?fid=$FID")
+echo "$RESOLVED_NAME"                  # e.g. test.txt
+[ "$RESOLVED_NAME" = "$(basename "$FILE")" ] && echo "FILENAME OK"
+curl -f -H "Authorization: Bearer $KEY" "$BASE/resolve?fid=$FID" -o /dev/null -w "status=%{http_code}\n"
 ```
 
-If the returned URL is still `http://`, the vhost is not forwarding
-`X-Forwarded-Proto` (see step 3). Direct backend access without a proxy
-correctly reports `http`, since that is what was actually used.
+Consult the server log (`/var/log/fid_server_error.log`) for details on a
+non-200 response; response bodies are deliberately generic.
 
 API responses never reveal internal paths: downloads identify a file only by
 its basename (`Content-Disposition`), and error responses are generic — OS

@@ -70,15 +70,28 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({"error": message}).encode())
     
+    def send_empty_response(self, code, content_type="text/plain"):
+        """Send a response with an empty body and no content headers."""
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", 0)
+        self.end_headers()
+    
     def send_success_response(self, data, content_type="application/json"):
-        """Send success response."""
+        """Send a 200 response.
+
+        JSON data is serialized; any other content_type takes bytes, or str
+        which is UTF-8 encoded. The Content-Type header is always sent.
+        """
         self.send_response(200)
         if content_type == "application/json":
-            self.send_header("Content-Type", "application/json")
             response = json.dumps(data).encode()
+        elif isinstance(data, str):
+            response = data.encode("utf-8")
         else:
             response = data
         
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", len(response))
         self.end_headers()
         self.wfile.write(response)
@@ -318,48 +331,13 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
     
-    def external_url_parts(self):
-        """Return (scheme, host) of the URL as seen by the client.
-
-        Behind a reverse proxy, honors the standard forwarded headers so the
-        returned URL matches what the client actually used (e.g. https rather
-        than the backend's plain http). Falls back to Host/http for direct
-        access.
-        """
-        scheme = (
-            self.headers.get("X-Forwarded-Proto")
-            or self.headers.get("X-Forwarded-Protocol")
-            or ""
-        ).split(",")[0].strip()
-        if not scheme and self.headers.get("X-Forwarded-Ssl", "").lower() in ("on", "1"):
-            scheme = "https"
-        if not scheme:
-            scheme = "http"
-        host = (
-            self.headers.get("X-Forwarded-Host")
-            or self.headers.get("Host")
-            or "localhost"
-        ).split(",")[0].strip()
-        return scheme, host
-
-    def download_path_for(self, request_path):
-        """Map the /resolve or /verify endpoint to the /download endpoint.
-
-        Replaces only the endpoint segment, keeping any reverse-proxy prefix,
-        e.g. /api/resolve -> /api/download.
-        """
-        path = urlparse(request_path).path
-        for endpoint in ("/resolve", "/verify"):
-            if path.endswith(endpoint):
-                return path[: -len(endpoint)] + "/download"
-        return "/download"
-
     def handle_resolve(self, params, verify=False):
         """Handle /resolve or /verify?fid=<fid> requests.
-        
+
         Uses fid.resolve_single() for path resolution with self-healing.
-        Returns download URL instead of internal path for security.
-        Verification recalculates the content hash, without changing the fid.
+        Returns the plain filename of the resolved file (never an internal
+        path or a download URL). Verification recalculates the content hash,
+        without changing the fid; a mismatch returns 409.
         """
         fid_list = params.get("fid", [])
         
@@ -381,7 +359,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         
         if resolved_path is None:
             # resolve_single() already printed error and cleaned up stale paths
-            self.send_error_response(404, "fid not found")
+            self.send_empty_response(404)
             return
         
         # Get the full fid (resolve_single validates it exists)
@@ -399,14 +377,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 self.send_error_response(409, "FID_MISMATCH")
                 return
         
-        # Construct download URL (never expose internal paths).
-        # Echo the same scheme, host and proxy prefix the client used to reach
-        # /resolve (or /verify), swapping only the endpoint to /download, so
-        # the URL is correct behind a TLS reverse proxy.
-        scheme, host = self.external_url_parts()
-        download_url = f"{scheme}://{host}{self.download_path_for(self.path)}?fid={md5_b62}"
-        
-        self.send_success_response({"fid": md5_b62, "url": download_url})
+        # Only expose the filename; never the internal path.
+        filename = os.path.basename(resolved_path.rstrip("/")) or fid_prefix
+        self.send_success_response(
+            filename.encode("utf-8"),
+            content_type="text/plain; charset=utf-8",
+        )
     
     def handle_upload(self):
         """Handle /upload POST request with fid and filename from query parameters.
