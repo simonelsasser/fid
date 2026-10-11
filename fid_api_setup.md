@@ -78,6 +78,7 @@ once, and `Listen 443` exists once:
 LoadModule proxy_module libexec/apache2/mod_proxy.so
 LoadModule proxy_http_module libexec/apache2/mod_proxy_http.so
 LoadModule ssl_module libexec/apache2/mod_ssl.so
+LoadModule headers_module libexec/apache2/mod_headers.so
 ```
 
 For a new hostname, create `/etc/apache2/extra/fid-https.conf`:
@@ -91,11 +92,18 @@ For a new hostname, create `/etc/apache2/extra/fid-https.conf`:
     ProxyRequests Off
     ProxyPassInherit Off
     ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
     LimitRequestBody 0
     ProxyPass        /api/ http://127.0.0.1:8080/ timeout=300
     ProxyPassReverse /api/ http://127.0.0.1:8080/
 </VirtualHost>
 ```
+
+`RequestHeader set X-Forwarded-Proto "https"` lets the backend rebuild the
+external URL (scheme/host/proxy prefix) that the client used, so `/resolve`
+and `/verify` return a working `https://…/api/download?fid=…` URL instead of a
+hard-coded HTTP one. `ProxyPreserveHost On` keeps the public hostname in the
+`Host` header.
 
 Add `Include /private/etc/apache2/extra/fid-https.conf` to `httpd.conf`.
 For an existing hostname, put these proxy/body directives inside its existing
@@ -193,8 +201,28 @@ Use a publicly trusted certificate or a private CA trusted by **the selected
 Python interpreter**. For a private CA, `curl --cacert /path/to/ca.pem` tests it;
 `SSL_CERT_FILE=/path/to/ca-bundle.pem fid resolve ...` supplies Python's CA bundle.
 The certificate must also match the hostname. Keychain trust alone may not
-suffice for every Python distribution. Do not use `/resolve`'s returned URL:
-it hard-codes HTTP and omits the proxy prefix.
+suffice for every Python distribution.
+
+`/resolve` and `/verify` now return a working download URL built from the
+client's own request: same scheme (`https` via `X-Forwarded-Proto`), same
+host, and the `/resolve` (or `/verify`) part swapped to `/download`, so it
+keeps the proxy prefix. Verify it after deployment:
+
+```bash
+RESOLVE_JSON=$(curl -f -H "Authorization: Bearer $KEY" "$BASE/resolve?fid=$FID")
+echo "$RESOLVE_JSON"                     # {"fid": "...", "url": "https://example.domain.com/api/download?fid=..."}
+DOWNLOAD_URL=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<< "$RESOLVE_JSON")
+curl -f -H "Authorization: Bearer $KEY" "$DOWNLOAD_URL" -o /tmp/fid-api-url.txt
+cmp "$FILE" /tmp/fid-api-url.txt
+```
+
+If the returned URL is still `http://`, the vhost is not forwarding
+`X-Forwarded-Proto` (see step 3). Direct backend access without a proxy
+correctly reports `http`, since that is what was actually used.
+
+API responses never reveal internal paths: downloads identify a file only by
+its basename (`Content-Disposition`), and error responses are generic — OS
+error text that may embed a full path goes to the server log only.
 
 ## 6. Other machines (optional)
 

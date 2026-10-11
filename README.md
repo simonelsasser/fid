@@ -651,6 +651,17 @@ return 404; a missing fid parameter returns 400. It uses the same authentication
 as other endpoints and does not update the registered fid. Verification reads
 the whole file, detecting same-size changes that `/resolve` cannot detect.
 
+Both `/resolve` and `/verify` return a download URL built from the client's own
+request: the scheme honors `X-Forwarded-Proto` (so it is `https` behind a TLS
+reverse proxy), the host honors `X-Forwarded-Host` or `Host`, and the
+`/resolve` (or `/verify`) segment is swapped to `/download` (keeping any proxy
+prefix such as `/api`).
+
+API responses never reveal internal file paths. Downloads identify the file
+only by its basename in the `Content-Disposition` header, and error responses
+are generic (no OS error text, which may embed a full path); details go to the
+server log only.
+
 Downloads stream in 1 MiB chunks with a `Content-Length` header, rather than
 loading the whole file into memory. The server still handles requests serially;
 uploads, when enabled, are still buffered in memory.

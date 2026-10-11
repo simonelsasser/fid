@@ -109,7 +109,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 print(f"fid-api: download failed: {e}", file=sys.stderr)
             else:
-                self.send_error_response(500, f"cannot read file: {e}")
+                self.send_error_response(500, "cannot read file")
     
     def check_auth(self):
         """Check authentication if configured."""
@@ -318,6 +318,42 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
     
+    def external_url_parts(self):
+        """Return (scheme, host) of the URL as seen by the client.
+
+        Behind a reverse proxy, honors the standard forwarded headers so the
+        returned URL matches what the client actually used (e.g. https rather
+        than the backend's plain http). Falls back to Host/http for direct
+        access.
+        """
+        scheme = (
+            self.headers.get("X-Forwarded-Proto")
+            or self.headers.get("X-Forwarded-Protocol")
+            or ""
+        ).split(",")[0].strip()
+        if not scheme and self.headers.get("X-Forwarded-Ssl", "").lower() in ("on", "1"):
+            scheme = "https"
+        if not scheme:
+            scheme = "http"
+        host = (
+            self.headers.get("X-Forwarded-Host")
+            or self.headers.get("Host")
+            or "localhost"
+        ).split(",")[0].strip()
+        return scheme, host
+
+    def download_path_for(self, request_path):
+        """Map the /resolve or /verify endpoint to the /download endpoint.
+
+        Replaces only the endpoint segment, keeping any reverse-proxy prefix,
+        e.g. /api/resolve -> /api/download.
+        """
+        path = urlparse(request_path).path
+        for endpoint in ("/resolve", "/verify"):
+            if path.endswith(endpoint):
+                return path[: -len(endpoint)] + "/download"
+        return "/download"
+
     def handle_resolve(self, params, verify=False):
         """Handle /resolve or /verify?fid=<fid> requests.
         
@@ -363,9 +399,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 self.send_error_response(409, "FID_MISMATCH")
                 return
         
-        # Construct download URL (never expose internal paths)
-        host = self.headers.get("Host", "localhost")
-        download_url = f"http://{host}/?fid={md5_b62}"
+        # Construct download URL (never expose internal paths).
+        # Echo the same scheme, host and proxy prefix the client used to reach
+        # /resolve (or /verify), swapping only the endpoint to /download, so
+        # the URL is correct behind a TLS reverse proxy.
+        scheme, host = self.external_url_parts()
+        download_url = f"{scheme}://{host}{self.download_path_for(self.path)}?fid={md5_b62}"
         
         self.send_success_response({"fid": md5_b62, "url": download_url})
     
@@ -410,7 +449,8 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         try:
             content = self.rfile.read(content_length)
         except Exception as e:
-            self.send_error_response(500, f"cannot read upload: {e}")
+            print(f"fid-api: cannot read upload: {e}", file=sys.stderr)
+            self.send_error_response(500, "cannot read upload")
             return
         
         # Calculate fid from content and verify it matches provided fid
@@ -482,6 +522,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             # Clean up on failure
             import traceback
+            print(f"fid-api: cannot save upload: {e}", file=sys.stderr)
             traceback.print_exc()
             try:
                 if os.path.exists(final_path):
@@ -490,7 +531,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                     os.rmdir(fid_dir)
             except:
                 pass
-            self.send_error_response(500, f"cannot save file: {e}")
+            self.send_error_response(500, "cannot save file")
     
     def handle_list(self):
         """Handle /list request."""
