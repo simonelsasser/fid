@@ -13,6 +13,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import json
 import shutil
+import sqlite3
+from functools import wraps
 
 # Import fid functions from the same directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +31,7 @@ from fid import (
     base62_encode,
     FID_HOME,
     CACHE_DIR,
+    permission_error_message,
 )
 
 
@@ -36,16 +39,40 @@ from fid import (
 
 DEFAULT_PORT = 8080
 DEFAULT_UPLOAD_DIR = os.path.join(FID_HOME, "server_uploads")
+DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+
+
+def storage_errors(handler):
+    """Convert storage failures to generic API errors, with local diagnostics."""
+    @wraps(handler)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return handler(self, *args, **kwargs)
+        except (OSError, sqlite3.Error) as error:
+            message = permission_error_message(error)
+            print(f"fid-api: {message or error}", file=sys.stderr)
+            status = 403 if isinstance(error, PermissionError) else 500
+            if self.command == "HEAD":
+                self.send_response(status)
+                self.end_headers()
+            else:
+                self.send_error_response(status, "storage access denied" if message else "storage error")
+    return wrapped
 
 
 class FidServerConfig:
     """Server configuration."""
     
-    def __init__(self, port, upload_dir, auth_key=None, allow_upload=False):
+    def __init__(self, port, upload_dir, auth_key=None, allow_upload=False,
+                 max_upload_bytes=DEFAULT_MAX_UPLOAD_BYTES):
         self.port = port
         self.upload_dir = upload_dir
         self.auth_key = auth_key
         self.allow_upload = allow_upload
+        if max_upload_bytes <= 0:
+            raise ValueError("max_upload_bytes must be positive")
+        self.max_upload_bytes = max_upload_bytes
+        self.upload_dir = os.path.abspath(os.path.expanduser(upload_dir))
         
         # Ensure upload directory exists
         if self.allow_upload:
@@ -65,10 +92,12 @@ class FidRequestHandler(BaseHTTPRequestHandler):
     
     def send_error_response(self, code, message):
         """Send JSON error response."""
+        response = json.dumps({"error": message}).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(response))
         self.end_headers()
-        self.wfile.write(json.dumps({"error": message}).encode())
+        self.wfile.write(response)
     
     def send_empty_response(self, code, content_type="text/plain"):
         """Send a response with an empty body and no content headers."""
@@ -122,7 +151,10 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 print(f"fid-api: download failed: {e}", file=sys.stderr)
             else:
-                self.send_error_response(500, "cannot read file")
+                message = permission_error_message(e)
+                if message:
+                    print(f"fid-api: {message}", file=sys.stderr)
+                self.send_error_response(403 if isinstance(e, PermissionError) else 500, "cannot read file")
     
     def check_auth(self):
         """Check authentication if configured."""
@@ -142,6 +174,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         
         return False
     
+    @storage_errors
     def do_GET(self):
         """Handle GET requests."""
         if not self.check_auth():
@@ -149,7 +182,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             return
         
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = self.api_path(parsed.path)
         params = parse_qs(parsed.query)
         
         if path in ("/download", "/api/download"):
@@ -166,6 +199,14 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_error_response(404, "not found")
     
+    @staticmethod
+    def api_path(path):
+        """Accept the same routes with or without exactly one /api prefix."""
+        if path == "/api":
+            return "/"
+        return path[4:] if path.startswith("/api/") else path
+
+    @storage_errors
     def do_HEAD(self):
         """Handle HEAD requests (for remote file existence check)."""
         if not self.check_auth():
@@ -174,7 +215,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             return
         
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = self.api_path(parsed.path)
         params = parse_qs(parsed.query)
         
         # Support root and both download endpoint forms.
@@ -186,6 +227,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
     
+    @storage_errors
     def do_POST(self):
         """Handle POST requests."""
         if not self.check_auth():
@@ -193,7 +235,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             return
         
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = self.api_path(parsed.path)
         
         if path == "/upload":
             if not self.config.allow_upload:
@@ -370,8 +412,9 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         if verify:
             try:
                 actual_fid = base62_encode(md5_file(resolved_path))
-            except OSError:
-                self.send_error_response(500, "cannot read file for verification")
+            except OSError as error:
+                print(f"fid-api: {permission_error_message(error) or error}", file=sys.stderr)
+                self.send_error_response(403 if isinstance(error, PermissionError) else 500, "cannot read file for verification")
                 return
             if actual_fid != md5_b62:
                 self.send_error_response(409, "FID_MISMATCH")
@@ -407,15 +450,31 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         provided_fid = fid_list[0]
         
         # Validate fid format
-        if len(provided_fid) != 22:
+        if len(provided_fid) != 22 or any(c not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for c in provided_fid):
             self.send_error_response(400, "invalid fid format")
             return
         
         # Get filename from query parameter
         filename_list = params.get("filename", [])
         filename = filename_list[0] if filename_list else None
+        if filename is not None and (
+            filename in (".", "..") or "/" in filename or "\\" in filename
+            or ":" in filename or any(ord(c) < 32 or ord(c) == 127 for c in filename)
+        ):
+            self.send_error_response(400, "invalid filename")
+            self.close_connection = True
+            return
         
-        content_length = int(self.headers.get("Content-Length", 0))
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
+            self.send_error_response(400, "invalid or missing Content-Length")
+            self.close_connection = True
+            return
+        content_length = int(lengths[0])
+        if content_length > self.config.max_upload_bytes:
+            self.send_error_response(413, "upload exceeds size limit")
+            self.close_connection = True
+            return
         
         if content_length == 0:
             self.send_error_response(400, "no file content")
@@ -430,6 +489,10 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             return
         
         # Calculate fid from content and verify it matches provided fid
+        if len(content) != content_length:
+            self.send_error_response(400, "incomplete upload")
+            self.close_connection = True
+            return
         import hashlib
         md5_hash = hashlib.md5(content)
         md5_bytes = md5_hash.digest()
@@ -465,7 +528,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             for (path,) in upload_paths:
                 pfx, val = split_path(path)
                 # Check if path is under server uploads directory
-                if val.startswith(self.config.upload_dir) and os.path.exists(val):
+                if os.path.commonpath((os.path.abspath(val), self.config.upload_dir)) == self.config.upload_dir and os.path.exists(val):
                     # File exists in server uploads with matching size
                     self.send_success_response({
                         "fid": provided_fid,
@@ -475,16 +538,25 @@ class FidRequestHandler(BaseHTTPRequestHandler):
                     return
         
         # Save file to uploads directory in <fid>/<filename> structure
+        created_file = False
         try:
             fid_dir = os.path.join(self.config.upload_dir, provided_fid)
+            if os.path.islink(fid_dir):
+                self.send_error_response(400, "unsafe upload path")
+                return
             os.makedirs(fid_dir, exist_ok=True)
             
             # Use provided filename or fallback to fid
             final_filename = filename if filename else provided_fid
             final_path = os.path.join(fid_dir, final_filename)
+            upload_root = os.path.realpath(self.config.upload_dir)
+            if os.path.commonpath((upload_root, os.path.realpath(final_path))) != upload_root or os.path.islink(final_path):
+                self.send_error_response(400, "unsafe upload path")
+                return
             
-            # Write file
-            with open(final_path, "wb") as f:
+            # Never follow a symlink or overwrite an existing file.
+            with open(final_path, "xb") as f:
+                created_file = True
                 f.write(content)
             
             # Register in fid database
@@ -501,13 +573,19 @@ class FidRequestHandler(BaseHTTPRequestHandler):
             print(f"fid-api: cannot save upload: {e}", file=sys.stderr)
             traceback.print_exc()
             try:
-                if os.path.exists(final_path):
+                if created_file and os.path.exists(final_path):
                     os.remove(final_path)
                 if os.path.isdir(fid_dir) and not os.listdir(fid_dir):
                     os.rmdir(fid_dir)
             except:
                 pass
-            self.send_error_response(500, "cannot save file")
+            message = permission_error_message(e)
+            if message:
+                print(f"fid-api: {message}", file=sys.stderr)
+            if isinstance(e, FileExistsError):
+                self.send_error_response(409, "upload file already exists")
+            else:
+                self.send_error_response(403 if isinstance(e, PermissionError) else 500, "cannot save file")
     
     def handle_list(self):
         """Handle /list request."""
@@ -608,14 +686,24 @@ Examples:
         action="store_true",
         help="Enable upload and list endpoints (disabled by default)"
     )
+
+    parser.add_argument(
+        "--max-upload-bytes",
+        type=int,
+        default=DEFAULT_MAX_UPLOAD_BYTES,
+        help="Maximum upload size in bytes (default: 1073741824, 1 GiB; must be positive)"
+    )
     
     args = parser.parse_args()
+    if args.max_upload_bytes <= 0:
+        parser.error("--max-upload-bytes must be positive")
     
     config = FidServerConfig(
         port=args.port,
         upload_dir=args.upload_dir,
         auth_key=args.auth_key,
-        allow_upload=args.enable_upload
+        allow_upload=args.enable_upload,
+        max_upload_bytes=args.max_upload_bytes
     )
     
     server = FidServer(config)
@@ -623,4 +711,8 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, sqlite3.Error) as error:
+        print(f"fid-api: {permission_error_message(error) or error}", file=sys.stderr)
+        sys.exit(1)

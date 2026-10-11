@@ -32,7 +32,19 @@ On Monterey, Python may require Command Line Tools installation; if `python3`
 is unavailable, install a Python distribution supporting Monterey. Use its
 absolute executable path in the plist, rather than relying on launchd's PATH.
 
-macOS data location is hard-coded: `/Library/Application Support/fid`.
+The default macOS data location remains `/Library/Application Support/fid`
+(Linux: `~/.fid`). Set `FID_HOME` to override it for both CLI and API; `~` is
+expanded and relative paths are resolved against the current working directory.
+Use an absolute path for services. For a user-owned registry, run as that user:
+
+```bash
+export FID_HOME="$HOME/.fid"
+mkdir -p "$FID_HOME"
+```
+
+Changing `FID_HOME` selects a different registry; it does not migrate existing
+data. Set the same value in every CLI shell and in the service configuration.
+Alternatively, to keep the system-wide default:
 Choose the ordinary account that will run both the daemon and local fid CLI as
 `YOUR_USER`. On a **new installation**, prepare writable data directories:
 
@@ -63,6 +75,9 @@ too. Stop the foreground server with Ctrl-C before step 4. The default exposes
 download, resolve and verify. Add `--enable-upload` to enable `/upload` and `/list`;
 uploads then default to the data directory's `server_uploads/`. The old
 `--no-upload` flag has been replaced.
+Uploads have a default 1 GiB limit. Override it with a positive byte count,
+e.g. `--max-upload-bytes 536870912` for 512 MiB. Filenames must be plain
+basenames, not paths; uploads cannot overwrite existing files or follow symlinks.
 
 The API binds **all IPv4 interfaces**, with no `--host` option. Restrict inbound
 TCP 8080 using the site's persistent host/network firewall while allowing local
@@ -102,6 +117,9 @@ TLS vhost instead; place `/api/` rules **before** any catch-all `ProxyPass /`.
 `ProxyPassInherit Off` excludes inherited global proxy rules; check that this
 is appropriate for the chosen vhost. Both trailing slashes are intentional:
 public `/api/resolve` becomes backend `/resolve`, and `/api/?fid=ID` becomes `/?fid=ID`.
+The backend also accepts `/api/` aliases for all these routes, so proxies that
+preserve the prefix work too. HEAD supports root/download routes only. The
+same authentication and upload restrictions apply to either route form.
 
 ```bash
 sudo /usr/sbin/apachectl configtest
@@ -123,6 +141,9 @@ Create `/Library/LaunchDaemons/com.fid.server.plist` with substituted values:
 <plist version="1.0"><dict>
     <key>Label</key><string>com.fid.server</string>
     <key>UserName</key><string>YOUR_USER</string>
+    <key>EnvironmentVariables</key><dict>
+        <key>FID_HOME</key><string>/Users/YOUR_USER/.fid</string>
+    </dict>
     <key>ProgramArguments</key><array>
         <string>PYTHON_PATH</string>
         <string>/usr/local/bin/fid_api.py</string>
@@ -139,6 +160,9 @@ Create `/Library/LaunchDaemons/com.fid.server.plist` with substituted values:
 
 For upload support, add `<string>--enable-upload</string>` inside the
 `ProgramArguments` array. Omit it for download/resolve/verify only.
+The example uses a user-owned registry: create it as `YOUR_USER`, and export
+the same `FID_HOME` for local CLI commands. To use an existing system-wide
+registry instead, set the plist's `FID_HOME` to `/Library/Application Support/fid`.
 
 ```bash
 sudo chown root:wheel /Library/LaunchDaemons/com.fid.server.plist
@@ -212,6 +236,27 @@ non-200 response; response bodies are deliberately generic.
 API responses never reveal internal paths: downloads identify a file only by
 its basename (`Content-Disposition`), and error responses are generic — OS
 error text that may embed a full path goes to the server log only.
+
+### Troubleshooting database and macOS volume permissions
+
+- **Read-only database:** the service user needs write access to the database
+  **and its parent directory** (SQLite creates journal files there). Check
+  `FID_HOME`, ownership and whether the volume is mounted read-only. Do not
+  recursively change ownership of an existing shared registry without checking
+  which accounts use it.
+- **Operation not permitted:** filesystem ownership and macOS privacy/TCC are
+  separate. Grant access to the app actually reading the files: Terminal/iTerm
+  for interactive use, or the Python executable/service app for launchd.
+  Monterey: System Preferences → Security & Privacy → Privacy; newer macOS:
+  System Settings → Privacy & Security. Check Files and Folders (including
+  removable/network volumes), or Full Disk Access when needed.
+- A terminal's privacy grant does not automatically cover a LaunchDaemon.
+  Restart the terminal/service after changing grants. Run the daemon under the
+  intended data-owning user and test a real file on the external volume.
+  `sudo` does not bypass TCC; launching an app with `open` is not a general fix.
+- The volume must be mounted before use; check its actual path under `/Volumes`.
+  Client data directories must be writable too. API errors stay generic;
+  detailed permission diagnostics appear in the server's stderr log.
 
 ## 6. Other machines (optional)
 

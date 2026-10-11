@@ -669,6 +669,16 @@ Downloads stream in 1 MiB chunks with a `Content-Length` header, rather than
 loading the whole file into memory. The server still handles requests serially;
 uploads, when enabled, are still buffered in memory.
 
+CLI and API honor `FID_HOME` (for example `export FID_HOME="$HOME/.fid"`);
+existing platform defaults are unchanged. Both processes must select the same
+registry. This override does not migrate data. See [the setup guide](fid_api_setup.md)
+for launchd environment settings and macOS external-volume privacy permissions.
+
+All API routes accept an optional `/api` prefix, with identical authentication
+and upload restrictions. Uploads require a valid `Content-Length` and a safe
+basename, and cannot overwrite existing files or follow symlinks. Their default
+limit is 1 GiB; configure a positive limit with `--max-upload-bytes BYTES`.
+
 ## Client Setup - New Repository
 
 ### Step 1: Install fid

@@ -14,7 +14,9 @@ from datetime import datetime
 
 ################ CONFIG ################
 
-if platform.system() == "Darwin":
+if os.environ.get("FID_HOME"):
+    FID_HOME = os.path.abspath(os.path.expanduser(os.environ["FID_HOME"]))
+elif platform.system() == "Darwin":
     FID_HOME = "/Library/Application Support/fid"
 else:
     FID_HOME = os.path.join(os.path.expanduser("~"), ".fid")
@@ -26,12 +28,28 @@ KEEP_CACHE = True
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 ########################################
 
 
 ############ INIT ######################
+
+
+def permission_error_message(error):
+    """Return actionable local diagnostics for storage access failures."""
+    if isinstance(error, sqlite3.OperationalError) and any(
+        text in str(error).lower() for text in ("readonly", "read-only", "unable to open")
+    ):
+        return (f"Cannot write to or open fid database at {DB}. Check FID_HOME, "
+                "database ownership, and write access to its parent directory.")
+    if isinstance(error, PermissionError) or (
+        isinstance(error, OSError) and error.errno == 30
+    ):
+        return ("Cannot access file or directory: check filesystem permissions and "
+                "read-only mounts. On macOS, also check privacy permissions for "
+                "the terminal or service accessing the volume.")
+    return None
 
 
 def ensure_dirs():
@@ -61,9 +79,10 @@ def db():
     try:
         c.execute("ALTER TABLE files ADD COLUMN size INTEGER")
         conn.commit()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as error:
         # Column already exists, ignore
-        pass
+        if "duplicate column name" not in str(error).lower():
+            raise
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS locations(
@@ -178,7 +197,9 @@ def expand_paths(paths):
                     item_path = os.path.join(norm_path, item)
                     if os.path.isfile(item_path):
                         expanded.append(item_path)
-            except:
+            except PermissionError:
+                raise
+            except OSError:
                 print(f"cannot read directory: {norm_path}", file=sys.stderr)
         else:
             expanded.append(norm_path)
@@ -2017,4 +2038,11 @@ def main():
 
 if __name__ == "__main__":
 
-    main()
+    try:
+        main()
+    except (OSError, sqlite3.OperationalError) as error:
+        message = permission_error_message(error)
+        if message is None:
+            raise
+        print(f"fid: {message}", file=sys.stderr)
+        sys.exit(1)
