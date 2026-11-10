@@ -214,6 +214,11 @@ body on a match, or HTTP 409 (`FID_MISMATCH`) on changed content. It reads the
 whole file and does not change the registered fid. Both accept full IDs or
 unique prefixes.
 
+All API file lookups are local-only (including existing cached files). Registered
+remotes and stored remote URLs are not queried; unavailable local files return
+404. Only the interactive CLI performs remote discovery/downloads, preventing
+API-to-API lookup loops in a mesh.
+
 Use a publicly trusted certificate or a private CA trusted by **the selected
 Python interpreter**. For a private CA, `curl --cacert /path/to/ca.pem` tests it;
 `SSL_CERT_FILE=/path/to/ca-bundle.pem fid resolve ...` supplies Python's CA bundle.

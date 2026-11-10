@@ -679,6 +679,11 @@ and upload restrictions. Uploads require a valid `Content-Length` and a safe
 basename, and cannot overwrite existing files or follow symlinks. Their default
 limit is 1 GiB; configure a positive limit with `--max-upload-bytes BYTES`.
 
+API download, resolve and verify handlers serve local files only, including
+already-cached files. They never query registered remotes or fetch stored remote
+URLs. Use the CLI for remote resolution; this separation prevents lookup loops
+between API servers in a mesh.
+
 ## Client Setup - New Repository
 
 ### Step 1: Install fid

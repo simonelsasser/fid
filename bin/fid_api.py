@@ -376,7 +376,7 @@ class FidRequestHandler(BaseHTTPRequestHandler):
     def handle_resolve(self, params, verify=False):
         """Handle /resolve or /verify?fid=<fid> requests.
 
-        Uses fid.resolve_single() for path resolution with self-healing.
+        Looks up local paths only; never queries or downloads from remotes.
         Returns the plain filename of the resolved file (never an internal
         path or a download URL). Verification recalculates the content hash,
         without changing the fid; a mismatch returns 409.
@@ -389,25 +389,30 @@ class FidRequestHandler(BaseHTTPRequestHandler):
         
         fid_prefix = fid_list[0]
         
-        # Use fid.resolve_single() which handles:
-        # - Prefix lookup
-        # - Path existence checking
-        # - Self-healing (removes stale paths)
-        # - Size validation (if check_size=True)
-        from fid import resolve_single
-        
-        # Verify hashes even size-mismatched files to report a content mismatch.
-        resolved_path = resolve_single(fid_prefix, check_size=not verify)
-        
-        if resolved_path is None:
-            # resolve_single() already printed error and cleaned up stale paths
-            self.send_empty_response(404)
-            return
-        
-        # Get the full fid (resolve_single validates it exists)
         conn = db()
         matches = lookup(conn, fid_prefix)
+        if len(matches) != 1:
+            conn.close()
+            self.send_empty_response(404)
+            return
         md5_hex, md5_b62 = matches[0]
+        try:
+            stored_size = conn.execute("SELECT size FROM files WHERE md5_hex=?", (md5_hex,)).fetchone()[0]
+            rows = conn.execute("SELECT path FROM locations WHERE md5_hex=?", (md5_hex,)).fetchall()
+            resolved_path = None
+            for (path,) in rows:
+                scheme, value = split_path(path)
+                if scheme != "local" or not os.path.isfile(value):
+                    continue
+                if not verify and stored_size is not None and os.path.getsize(value) != stored_size:
+                    continue
+                resolved_path = value
+                break
+        finally:
+            conn.close()
+        if resolved_path is None:
+            self.send_empty_response(404)
+            return
 
         if verify:
             try:
